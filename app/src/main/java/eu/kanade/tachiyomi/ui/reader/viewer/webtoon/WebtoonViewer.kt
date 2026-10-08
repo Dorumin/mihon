@@ -234,7 +234,7 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
      * Tells this viewer to set the given [chapters] as active.
      */
     override fun setChapters(chapters: ViewerChapters) {
-        val forceTransition = config.alwaysShowChapterTransition || currentPage is ChapterTransition
+        val forceTransition = config.alwaysShowChapterTransition
         adapter.setChapters(chapters, forceTransition)
 
         if (recycler.isGone) {
@@ -242,6 +242,12 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
             val pages = chapters.currChapter.pages ?: return
             moveToPage(pages[min(chapters.currChapter.requestedPage, pages.lastIndex)])
             recycler.isVisible = true
+        }
+
+        // Preload the next chapter right away for single-page chapters, so the
+        // transition page doesn't linger until the next chapter finishes loading.
+        if (chapters.currChapter.pages?.size == 1) {
+            chapters.nextChapter?.let(activity::requestPreloadChapter)
         }
     }
 

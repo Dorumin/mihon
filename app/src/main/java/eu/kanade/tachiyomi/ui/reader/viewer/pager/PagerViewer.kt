@@ -74,9 +74,6 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
                 awaitingIdleViewerChapters?.let { viewerChapters ->
                     setChaptersInternal(viewerChapters)
                     awaitingIdleViewerChapters = null
-                    if (viewerChapters.currChapter.pages?.size == 1) {
-                        adapter.nextTransition?.to?.let(activity::requestPreloadChapter)
-                    }
                 }
             }
         }
@@ -279,8 +276,7 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         // Remove listener so the change in item doesn't trigger it
         pager.removeOnPageChangeListener(pagerListener)
 
-        val forceTransition = config.alwaysShowChapterTransition ||
-            adapter.items.getOrNull(pager.currentItem) is ChapterTransition
+        val forceTransition = config.alwaysShowChapterTransition
         adapter.setChapters(chapters, forceTransition)
 
         // Layout the pager once a chapter is being set
@@ -294,6 +290,14 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         pager.addOnPageChangeListener(pagerListener)
         // Manually call onPageChange to update the UI
         onPageChange(pager.currentItem)
+
+        // Preload the next chapter right away for single-page chapters. The regular
+        // "within the last 5 pages" trigger gives them no lead time, so a quick tap to
+        // continue could otherwise land on (and linger on) the transition page before
+        // the next chapter finishes loading.
+        if (chapters.currChapter.pages?.size == 1) {
+            chapters.nextChapter?.let(activity::requestPreloadChapter)
+        }
     }
 
     /**

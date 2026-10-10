@@ -215,6 +215,16 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
                 activity.requestPreloadChapter(transitionChapter)
             }
         }
+
+        // Preload previous chapter once we're within the first 5 pages of the current chapter,
+        // mirroring the end-of-chapter trigger above
+        if (page.number - 1 < 5 && allowPreload && page.chapter == adapter.currentChapter) {
+            val firstItem = adapter.items.firstOrNull()
+            (firstItem as? ChapterTransition.Prev)?.to?.let { prevChapter ->
+                logcat { "Requesting to preload chapter ${prevChapter.chapter.chapter_number}" }
+                activity.requestPreloadChapter(prevChapter)
+            }
+        }
     }
 
     /**
@@ -244,10 +254,11 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
             recycler.isVisible = true
         }
 
-        // Preload the next chapter right away for single-page chapters, so the
-        // transition page doesn't linger until the next chapter finishes loading.
+        // Preload the adjacent chapters right away for single-page chapters, so the
+        // transition pages don't linger until the adjacent chapters finish loading.
         if (chapters.currChapter.pages?.size == 1) {
             chapters.nextChapter?.let(activity::requestPreloadChapter)
+            chapters.prevChapter?.let(activity::requestPreloadChapter)
         }
     }
 

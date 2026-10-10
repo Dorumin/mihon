@@ -31,6 +31,9 @@ class PagerViewerAdapter(private val viewer: PagerViewer) : ViewPagerAdapter() {
     var nextTransition: ChapterTransition.Next? = null
         private set
 
+    var prevTransition: ChapterTransition.Prev? = null
+        private set
+
     var currentChapter: ReaderChapter? = null
 
     /**
@@ -55,9 +58,12 @@ class PagerViewerAdapter(private val viewer: PagerViewer) : ViewPagerAdapter() {
         chapters.prevChapter?.pages?.let(newItems::addAll)
 
         // Skip transition page if the chapter is loaded & current page is not a transition page
-        if (prevHasMissingChapters || forceTransition || chapters.prevChapter?.state !is ReaderChapter.State.Loaded) {
-            newItems.add(ChapterTransition.Prev(chapters.currChapter, chapters.prevChapter))
-        }
+        prevTransition = ChapterTransition.Prev(chapters.currChapter, chapters.prevChapter)
+            .also {
+                if (prevHasMissingChapters || forceTransition || chapters.prevChapter?.state !is ReaderChapter.State.Loaded) {
+                    newItems.add(it)
+                }
+            }
 
         var insertPageLastPage: InsertPage? = null
 

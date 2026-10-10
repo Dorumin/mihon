@@ -221,14 +221,22 @@ class DownloadProvider(
     }
 
     /**
-     * Returns valid downloaded chapter directory names.
+     * Returns valid downloaded chapter directory names, ordered by preference.
+     * The hash-suffixed name is checked first so that chapters with duplicate
+     * names resolve to their own file instead of a same-named chapter's.
      *
      * @param chapter the domain chapter object.
      */
     fun getValidChapterDirNames(chapterName: String, chapterScanlator: String?, chapterUrl: String): List<String> {
         val parts = ChapterDirNameParts(chapterName, chapterScanlator, chapterUrl)
+        val disallowNonAscii = libraryPreferences.disallowNonAsciiFilenames.get()
+        val hashedDirName = parts.dirName(
+            disallowNonAscii = disallowNonAscii,
+            enableHash = true,
+            sanitizeScanlator = true,
+        )
         val chapterDirName = parts.dirName(
-            disallowNonAscii = libraryPreferences.disallowNonAsciiFilenames.get(),
+            disallowNonAscii = disallowNonAscii,
             enableHash = libraryPreferences.enableChapterNameHash.get(),
             sanitizeScanlator = true,
         )
@@ -236,16 +244,21 @@ class DownloadProvider(
 
         return buildList {
             // Folder of images
-            add(chapterDirName)
+            add(hashedDirName)
             // Archived chapters
-            add("$chapterDirName.cbz")
+            add("$hashedDirName.cbz")
+
+            if (hashedDirName != chapterDirName) {
+                add(chapterDirName)
+                add("$chapterDirName.cbz")
+            }
 
             // any legacy names
             legacyChapterDirNames.forEach {
                 add(it)
                 add("$it.cbz")
             }
-        }
+        }.distinct()
     }
 }
 

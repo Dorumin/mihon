@@ -397,6 +397,13 @@ class Downloader(
             download.chapter.scanlator,
             download.chapter.url,
         )
+        // Collision-free name, deterministically derived from the chapter URL
+        val collisionFreeDirname = provider.getChapterDirName(
+            download.chapter.name,
+            download.chapter.scanlator,
+            download.chapter.url,
+            enableChapterNameHash = true,
+        )
         val tmpDir = mangaDir.createDirectory(chapterDirname + TMP_DIR_SUFFIX)!!
 
         try {
@@ -454,12 +461,12 @@ class Downloader(
             )
 
             // Only rename the directory if it's downloaded
-            if (downloadPreferences.saveChaptersAsCBZ.get()) {
-                archiveChapter(mangaDir, chapterDirname, tmpDir)
+            val finalDirname = if (downloadPreferences.saveChaptersAsCBZ.get()) {
+                archiveChapter(mangaDir, chapterDirname, collisionFreeDirname, tmpDir)
             } else {
-                tmpDir.renameTo(chapterDirname)
+                finalizeChapterDirectory(mangaDir, tmpDir, chapterDirname, collisionFreeDirname)
             }
-            cache.addChapter(chapterDirname, mangaDir, download.manga)
+            cache.addChapter(finalDirname, mangaDir, download.manga)
 
             DiskUtil.createNoMediaFile(tmpDir, context)
 
@@ -662,20 +669,81 @@ class Downloader(
 
     /**
      * Archive the chapter pages as a CBZ.
+     *
+     * @return the directory name of the archive on disk, without extension.
      */
     private fun archiveChapter(
         mangaDir: UniFile,
         dirname: String,
+        collisionFreeDirname: String,
         tmpDir: UniFile,
-    ) {
+    ): String {
         val zip = mangaDir.createFile("$dirname.cbz$TMP_DIR_SUFFIX")!!
         ZipWriter(context, zip).use { writer ->
             tmpDir.listFiles()?.forEach { file ->
                 writer.write(file)
             }
         }
-        zip.renameTo("$dirname.cbz")
+        val finalDirname = renameToFinalName(mangaDir, zip, dirname, collisionFreeDirname, ".cbz")
         tmpDir.delete()
+        return finalDirname
+    }
+
+    /**
+     * Renames the temporary directory of a downloaded chapter to its final name,
+     * falling back to the collision-free name if the provider deduplicates it.
+     *
+     * @return the actual directory name on disk.
+     */
+    private fun finalizeChapterDirectory(
+        mangaDir: UniFile,
+        tmpDir: UniFile,
+        dirname: String,
+        collisionFreeDirname: String,
+    ): String {
+        return renameToFinalName(mangaDir, tmpDir, dirname, collisionFreeDirname, "")
+    }
+
+    /**
+     * Renames the downloaded chapter (archive or folder) to its final name.
+     *
+     * Storage providers may silently rename on conflict, e.g. to "Name (1).cbz",
+     * when the target already exists. In that case the file would no longer match
+     * any name derivable from the chapter, so it is retried with the collision-free
+     * (hash-suffixed) name instead.
+     *
+     * @return the actual directory name on disk, without extension.
+     */
+    private fun renameToFinalName(
+        mangaDir: UniFile,
+        file: UniFile,
+        dirname: String,
+        collisionFreeDirname: String,
+        extension: String,
+    ): String {
+        val targetName = "$dirname$extension"
+        if (file.renameTo(targetName) && file.name == targetName) return dirname
+
+        val fallbackTargetName = "$collisionFreeDirname$extension"
+        if (collisionFreeDirname != dirname) {
+            // Same chapter URL, so any existing file with that name is stale
+            mangaDir.findFile(fallbackTargetName)?.delete()
+            if (file.renameTo(fallbackTargetName) && file.name == fallbackTargetName) return collisionFreeDirname
+        } else {
+            // Already collision-free, so a conflict means a stale file from a
+            // previous attempt of this same chapter
+            mangaDir.findFile(targetName)?.delete()
+            if (file.renameTo(targetName) && file.name == targetName) return dirname
+        }
+
+        logcat(LogPriority.ERROR) {
+            "Failed to rename downloaded chapter to \"$targetName\"; it ended up as \"${file.name}\""
+        }
+        val actualName = file.name
+        return when {
+            actualName == null || actualName.endsWith(TMP_DIR_SUFFIX) -> dirname
+            else -> actualName.removeSuffix(extension)
+        }
     }
 
     /**

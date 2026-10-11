@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.foundation.text.input.clearText
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
@@ -261,6 +262,94 @@ fun AppBarActions(
 }
 
 /**
+ * The text field shown in a toolbar's title slot while a search is open, so that toolbars which
+ * aren't a [SearchToolbar] can offer the same typing.
+ *
+ * The field state and [focusRequester] belong to the caller, which usually also drives a search
+ * action from them, and keeps them across calls so typed text survives closing and reopening.
+ */
+@Composable
+fun AppBarSearchField(
+    searchFieldState: TextFieldState,
+    searchQuery: String?,
+    onChangeSearchQuery: (String?) -> Unit,
+    focusRequester: FocusRequester,
+    modifier: Modifier = Modifier,
+    placeholderText: String? = null,
+    onSearch: (String) -> Unit = {},
+    interactionSource: MutableInteractionSource = remember { MutableInteractionSource() },
+) {
+    val currentOnChangeSearchQuery by rememberUpdatedState(onChangeSearchQuery)
+    val searchOpen by rememberUpdatedState(searchQuery != null)
+
+    LaunchedEffect(searchFieldState) {
+        snapshotFlow { searchFieldState.text.toString() }
+            .drop(1)
+            .collect { if (searchOpen) currentOnChangeSearchQuery(it) }
+    }
+    LaunchedEffect(searchQuery) {
+        when {
+            searchQuery == null -> searchFieldState.clearText()
+            searchQuery != searchFieldState.text.toString() -> {
+                searchFieldState.setTextAndPlaceCursorAtEnd(searchQuery)
+            }
+        }
+    }
+
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+
+    val searchAndClearFocus: () -> Unit = f@{
+        val query = searchFieldState.text.toString()
+        if (query.isBlank()) return@f
+        onSearch(query)
+        focusManager.clearFocus()
+        keyboardController?.hide()
+        focusManager.moveFocus(FocusDirection.Next)
+    }
+
+    BasicTextField(
+        state = searchFieldState,
+        modifier = modifier
+            .fillMaxWidth()
+            .focusRequester(focusRequester)
+            .runOnEnterKeyPressed(action = searchAndClearFocus)
+            .showSoftKeyboard(searchQuery.isNullOrEmpty())
+            .clearFocusOnSoftKeyboardHide(),
+        textStyle = MaterialTheme.typography.titleMedium.copy(
+            color = MaterialTheme.colorScheme.onBackground,
+            fontWeight = FontWeight.Normal,
+            fontSize = 18.sp,
+        ),
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        onKeyboardAction = { searchAndClearFocus() },
+        lineLimits = TextFieldLineLimits.SingleLine,
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.onBackground),
+        interactionSource = interactionSource,
+        decorator = TextFieldDefaults.decorator(
+            state = searchFieldState,
+            enabled = true,
+            lineLimits = TextFieldLineLimits.SingleLine,
+            outputTransformation = null,
+            interactionSource = interactionSource,
+            placeholder = {
+                Text(
+                    modifier = Modifier.secondaryItemAlpha(),
+                    text = (placeholderText ?: stringResource(MR.strings.action_search_hint)),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Normal,
+                    ),
+                )
+            },
+            container = {},
+        ),
+    )
+}
+
+/**
  * @param searchEnabled Set to false if you don't want to show search action.
  * @param searchQuery If null, use normal toolbar.
  * @param placeholderText If null, [MR.strings.action_search_hint] is used.
@@ -282,78 +371,19 @@ fun SearchToolbar(
 ) {
     val focusRequester = remember { FocusRequester() }
     val searchFieldState = rememberTextFieldState(searchQuery.orEmpty())
-    val currentOnChangeSearchQuery by rememberUpdatedState(onChangeSearchQuery)
-    val searchOpen by rememberUpdatedState(searchQuery != null)
-
-    LaunchedEffect(searchFieldState) {
-        snapshotFlow { searchFieldState.text.toString() }
-            .drop(1)
-            .collect { if (searchOpen) currentOnChangeSearchQuery(it) }
-    }
-    LaunchedEffect(searchQuery) {
-        when {
-            searchQuery == null -> searchFieldState.clearText()
-            searchQuery != searchFieldState.text.toString() -> {
-                searchFieldState.setTextAndPlaceCursorAtEnd(searchQuery)
-            }
-        }
-    }
-
     AppBar(
         modifier = modifier,
         titleContent = {
             if (searchQuery == null) return@AppBar titleContent()
 
-            val keyboardController = LocalSoftwareKeyboardController.current
-            val focusManager = LocalFocusManager.current
-
-            val searchAndClearFocus: () -> Unit = f@{
-                val query = searchFieldState.text.toString()
-                if (query.isBlank()) return@f
-                onSearch(query)
-                focusManager.clearFocus()
-                keyboardController?.hide()
-                focusManager.moveFocus(FocusDirection.Next)
-            }
-
-            BasicTextField(
-                state = searchFieldState,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .focusRequester(focusRequester)
-                    .runOnEnterKeyPressed(action = searchAndClearFocus)
-                    .showSoftKeyboard(remember { searchQuery.isEmpty() })
-                    .clearFocusOnSoftKeyboardHide(),
-                textStyle = MaterialTheme.typography.titleMedium.copy(
-                    color = MaterialTheme.colorScheme.onBackground,
-                    fontWeight = FontWeight.Normal,
-                    fontSize = 18.sp,
-                ),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                onKeyboardAction = { searchAndClearFocus() },
-                lineLimits = TextFieldLineLimits.SingleLine,
-                cursorBrush = SolidColor(MaterialTheme.colorScheme.onBackground),
+            AppBarSearchField(
+                searchFieldState = searchFieldState,
+                searchQuery = searchQuery,
+                onChangeSearchQuery = onChangeSearchQuery,
+                focusRequester = focusRequester,
+                placeholderText = placeholderText,
+                onSearch = onSearch,
                 interactionSource = interactionSource,
-                decorator = TextFieldDefaults.decorator(
-                    state = searchFieldState,
-                    enabled = true,
-                    lineLimits = TextFieldLineLimits.SingleLine,
-                    outputTransformation = null,
-                    interactionSource = interactionSource,
-                    placeholder = {
-                        Text(
-                            modifier = Modifier.secondaryItemAlpha(),
-                            text = (placeholderText ?: stringResource(MR.strings.action_search_hint)),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.Normal,
-                            ),
-                        )
-                    },
-                    container = {},
-                ),
             )
         },
         navigateUp = if (searchQuery == null) navigateUp else onClickCloseSearch,

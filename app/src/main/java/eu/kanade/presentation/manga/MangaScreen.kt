@@ -101,6 +101,10 @@ fun MangaScreen(
     onContinueReading: () -> Unit,
     onSearch: (query: String, global: Boolean) -> Unit,
 
+    // Chapter search
+    searchQuery: String?,
+    onSearchQueryChange: (String?) -> Unit,
+
     // For cover dialog
     onCoverClicked: () -> Unit,
 
@@ -153,6 +157,8 @@ fun MangaScreen(
             onRefresh = onRefresh,
             onContinueReading = onContinueReading,
             onSearch = onSearch,
+            searchQuery = searchQuery,
+            onSearchQueryChange = onSearchQueryChange,
             onCoverClicked = onCoverClicked,
             onShareClicked = onShareClicked,
             onDownloadActionClicked = onDownloadActionClicked,
@@ -189,6 +195,8 @@ fun MangaScreen(
             onRefresh = onRefresh,
             onContinueReading = onContinueReading,
             onSearch = onSearch,
+            searchQuery = searchQuery,
+            onSearchQueryChange = onSearchQueryChange,
             onCoverClicked = onCoverClicked,
             onShareClicked = onShareClicked,
             onDownloadActionClicked = onDownloadActionClicked,
@@ -232,6 +240,10 @@ private fun MangaScreenSmallImpl(
     onContinueReading: () -> Unit,
     onSearch: (query: String, global: Boolean) -> Unit,
 
+    // Chapter search
+    searchQuery: String?,
+    onSearchQueryChange: (String?) -> Unit,
+
     // For cover dialog
     onCoverClicked: () -> Unit,
 
@@ -271,6 +283,10 @@ private fun MangaScreenSmallImpl(
         onAllChapterSelected(false)
     }
 
+    BackHandler(enabled = searchQuery != null) {
+        onSearchQueryChange(null)
+    }
+
     Scaffold(
         topBar = {
             val selectedChapterCount: Int = remember(chapters) {
@@ -301,6 +317,8 @@ private fun MangaScreenSmallImpl(
                 onClickRefresh = onRefresh,
                 onClickMigrate = onMigrateClicked,
                 onClickEditNotes = onEditNotesClicked,
+                searchQuery = state.searchQuery,
+                onSearchQueryChange = onSearchQueryChange,
                 actionModeCounter = selectedChapterCount,
                 onCancelActionMode = { onAllChapterSelected(false) },
                 onSelectAll = { onAllChapterSelected(true) },
@@ -474,6 +492,10 @@ fun MangaScreenLargeImpl(
     onContinueReading: () -> Unit,
     onSearch: (query: String, global: Boolean) -> Unit,
 
+    // Chapter search
+    searchQuery: String?,
+    onSearchQueryChange: (String?) -> Unit,
+
     // For cover dialog
     onCoverClicked: () -> Unit,
 
@@ -519,6 +541,10 @@ fun MangaScreenLargeImpl(
         onAllChapterSelected(false)
     }
 
+    BackHandler(enabled = searchQuery != null) {
+        onSearchQueryChange(null)
+    }
+
     Scaffold(
         topBar = {
             val selectedChapterCount = remember(chapters) {
@@ -536,6 +562,8 @@ fun MangaScreenLargeImpl(
                 onClickRefresh = onRefresh,
                 onClickMigrate = onMigrateClicked,
                 onClickEditNotes = onEditNotesClicked,
+                searchQuery = state.searchQuery,
+                onSearchQueryChange = onSearchQueryChange,
                 onCancelActionMode = { onAllChapterSelected(false) },
                 actionModeCounter = selectedChapterCount,
                 onSelectAll = { onAllChapterSelected(true) },

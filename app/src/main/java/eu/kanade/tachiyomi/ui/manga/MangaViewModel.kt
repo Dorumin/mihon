@@ -61,6 +61,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
@@ -68,7 +69,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import logcat.LogPriority
 import mihon.domain.chapter.interactor.FilterChaptersForDownload
+import mihon.domain.search.QueryNode
 import mihon.domain.source.interactor.UpdateMangaFromRemote
+import mihon.feature.manga.matches
 import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.core.common.preference.CheckboxState
 import tachiyomi.core.common.preference.TriState
@@ -177,6 +180,12 @@ class MangaViewModel(
 
     private val isRefreshingData = MutableStateFlow(false)
 
+    // Typed into the toolbar, and left out of the entry's chapter flags on purpose: it's meant to be used and dropped
+    private val searchQuery = MutableStateFlow<String?>(null)
+
+    // The chapter list is recomputed far more often than a query is retyped, so the query is parsed on its own flow
+    private val searchNode = searchQuery.map { it?.let { QueryNode.from(it) } }
+
     private val downloadStates = MutableStateFlow(emptyMap<Long, DownloadProgress>())
 
     // A finished chapter leaves the queue, and its last status change can be lost with it, so its state is left to
@@ -241,13 +250,16 @@ class MangaViewModel(
         scanlators,
         trackers,
         combine(selectedChapterIds, queuedDownloadStates, ::Pair),
-        combine(dialog, isRefreshingData, ::Pair),
+        // the query and its parsed form travel together, so a state always filters by its own query
+        combine(dialog, isRefreshingData, searchQuery, searchNode) { dialog, isRefreshingData, query, node ->
+            Triple(dialog, isRefreshingData, query to node)
+        },
     ) {
             mangaAndChapters,
             (availableScanlators, excludedScanlators),
             (trackingCount, hasLoggedInTrackers),
             (selectedIds, downloads),
-            (dialog, isRefreshingData),
+            (dialog, isRefreshingData, search),
         ->
         State.Success(
             manga = mangaAndChapters.manga,
@@ -270,6 +282,8 @@ class MangaViewModel(
             isRefreshingData = isRefreshingData,
             dialog = dialog,
             hideMissingChapters = hideMissingChapters,
+            searchQuery = search.first,
+            searchNode = search.second,
         )
     }
         .flowOn(Dispatchers.IO)
@@ -1051,6 +1065,10 @@ class MangaViewModel(
         }
     }
 
+    fun search(query: String?) {
+        searchQuery.update { query }
+    }
+
     private data class MangaAndChapters(val manga: Manga, val source: Source, val chapters: List<ChapterList.Item>)
 
     private data class DownloadProgress(val status: Download.State, val progress: Int)
@@ -1072,6 +1090,9 @@ class MangaViewModel(
             val isRefreshingData: Boolean = false,
             val dialog: Dialog? = null,
             val hideMissingChapters: Boolean = false,
+            val searchQuery: String? = null,
+            // Parsed from [searchQuery] once per query change, kept beside it so a state always filters by its own query
+            val searchNode: QueryNode? = null,
         ) : State {
             val processedChapters by lazy {
                 chapters.applyFilters(manga).toList()
@@ -1082,7 +1103,9 @@ class MangaViewModel(
             }
 
             val chapterListItems by lazy {
-                if (hideMissingChapters) {
+                // A search leaves chapters out for reasons unrelated to numbering, so the gaps it leaves
+                // between matches would read as missing chapters
+                if (hideMissingChapters || !searchQuery.isNullOrBlank()) {
                     return@lazy processedChapters
                 }
 
@@ -1131,6 +1154,7 @@ class MangaViewModel(
                     .filter { (chapter) -> applyFilter(unreadFilter) { !chapter.read } }
                     .filter { (chapter) -> applyFilter(bookmarkedFilter) { chapter.bookmark } }
                     .filter { applyFilter(downloadedFilter) { it.isDownloaded || isLocalManga } }
+                    .filter { searchNode == null || searchNode.matches(it) }
                     .sortedWith { (chapter1), (chapter2) -> getChapterSort(manga).invoke(chapter1, chapter2) }
             }
         }

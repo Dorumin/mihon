@@ -1,6 +1,6 @@
-package mihon.domain.library.model.search
+package mihon.domain.search
 
-object LibrarySearchLexer {
+object SearchLexer {
 
     private val regex = Regex(
         """
@@ -17,8 +17,9 @@ object LibrarySearchLexer {
             (?: " (?<CompValQuoted> [^"]* ) " | ' (?<CompValSingleQuoted> [^']* ) ' | (?<CompVal> [^\s,()]+ ))|
 
             # Key-Value fields
+            # the value may be empty, so "unread:" is the flag shorthand rather than plain text
             (?<Field> [a-zA-Z_][a-zA-Z0-9_]* ) :
-            (?: " (?<FieldValQuoted> [^"]* ) " | ' (?<FieldValSingleQuoted> [^']* ) ' | (?<FieldVal> [^\s,()]+ ))|
+            (?: " (?<FieldValQuoted> [^"]* ) " | ' (?<FieldValSingleQuoted> [^']* ) ' | (?<FieldVal> [^\s,()]* ))|
 
             # General catch-all
             (?: " (?<GeneralQuoted> [^"]* ) " | ' (?<GeneralSingleQuoted> [^']* ) ' | (?<General> [^\s,()]+ ))|

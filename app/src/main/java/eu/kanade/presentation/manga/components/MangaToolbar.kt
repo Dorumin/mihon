@@ -1,5 +1,8 @@
 package eu.kanade.presentation.manga.components
 
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.clearText
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.surfaceColorAtElevation
@@ -10,16 +13,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.unit.dp
 import eu.kanade.presentation.components.AppBar
 import eu.kanade.presentation.components.AppBarActions
+import eu.kanade.presentation.components.AppBarSearchField
 import eu.kanade.presentation.components.AppBarTitle
 import eu.kanade.presentation.components.DownloadDropdownMenu
 import eu.kanade.presentation.manga.DownloadAction
 import mihon.icons.materialsymbols.MaterialSymbols
+import mihon.icons.materialsymbols.rounded.Close
 import mihon.icons.materialsymbols.rounded.Download
 import mihon.icons.materialsymbols.rounded.FilterList
 import mihon.icons.materialsymbols.rounded.FlipToBack
+import mihon.icons.materialsymbols.rounded.Search
 import mihon.icons.materialsymbols.rounded.SelectAll
 import tachiyomi.i18n.MR
 import tachiyomi.presentation.core.i18n.stringResource
@@ -38,6 +45,10 @@ fun MangaToolbar(
     onClickMigrate: (() -> Unit)?,
     onClickEditNotes: () -> Unit,
 
+    // Chapter search. A null query means search is closed; the title is shown again.
+    searchQuery: String?,
+    onSearchQueryChange: (String?) -> Unit,
+
     // For action mode
     actionModeCounter: Int,
     onCancelActionMode: () -> Unit,
@@ -49,10 +60,24 @@ fun MangaToolbar(
     modifier: Modifier = Modifier,
 ) {
     val isActionMode = actionModeCounter > 0
+    val closeSearch: () -> Unit = f@{ onSearchQueryChange(null) }
+    // The title fades away at the top because the entry's own header says it; a query is said nowhere
+    // else, so while one is open the bar stays solid and the field stays opaque
+    val isSearchOpen = searchQuery != null
+    val focusRequester = remember { FocusRequester() }
+    val searchFieldState = rememberTextFieldState(searchQuery.orEmpty())
     AppBar(
         titleContent = {
             if (isActionMode) {
                 AppBarTitle(actionModeCounter.toString())
+            } else if (searchQuery != null) {
+                AppBarSearchField(
+                    searchFieldState = searchFieldState,
+                    searchQuery = searchQuery,
+                    onChangeSearchQuery = onSearchQueryChange,
+                    focusRequester = focusRequester,
+                    placeholderText = stringResource(MR.strings.chapter_search_hint),
+                )
             } else {
                 AppBarTitle(title, modifier = Modifier.alpha(titleAlphaProvider()))
             }
@@ -60,8 +85,8 @@ fun MangaToolbar(
         modifier = modifier,
         backgroundColor = MaterialTheme.colorScheme
             .surfaceColorAtElevation(3.dp)
-            .copy(alpha = if (isActionMode) 1f else backgroundAlphaProvider()),
-        navigateUp = navigateUp,
+            .copy(alpha = if (isActionMode || isSearchOpen) 1f else backgroundAlphaProvider()),
+        navigateUp = if (searchQuery == null) navigateUp else closeSearch,
         actions = {
             var downloadExpanded by remember { mutableStateOf(false) }
             if (onClickDownload != null) {
@@ -92,6 +117,27 @@ fun MangaToolbar(
                             ),
                         )
                         return@buildList
+                    }
+                    if (searchQuery == null) {
+                        add(
+                            AppBar.Action(
+                                title = stringResource(MR.strings.action_search),
+                                icon = MaterialSymbols.Rounded.Search,
+                                onClick = { onSearchQueryChange("") },
+                            ),
+                        )
+                    } else if (searchQuery.isNotEmpty()) {
+                        add(
+                            AppBar.Action(
+                                title = stringResource(MR.strings.action_reset),
+                                icon = MaterialSymbols.Rounded.Close,
+                                onClick = {
+                                    searchFieldState.clearText()
+                                    onSearchQueryChange("")
+                                    focusRequester.requestFocus()
+                                },
+                            ),
+                        )
                     }
                     if (onClickDownload != null) {
                         add(

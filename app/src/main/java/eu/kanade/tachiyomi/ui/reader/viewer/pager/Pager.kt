@@ -32,6 +32,10 @@ open class Pager(
      */
     private val gestureListener = object : GestureDetectorWithLongTap.Listener() {
         override fun onSingleTapConfirmed(ev: MotionEvent): Boolean {
+            // Already invoked when the finger was lifted, on a tap zone
+            if (gestureDetector.isHandledByImmediateTap(ev)) {
+                return true
+            }
             tapListener?.invoke(ev)
             return true
         }
@@ -47,7 +51,18 @@ open class Pager(
     /**
      * Gesture detector which handles motion events.
      */
-    private val gestureDetector = GestureDetectorWithLongTap(context, gestureListener)
+    // Type is spelled out because the gesture listener now reads back this detector
+    private val gestureDetector: GestureDetectorWithLongTap = GestureDetectorWithLongTap(context, gestureListener)
+
+    /**
+     * Whether a tap on the given on down event lands on a tap zone to register without waiting
+     * for the double tap timeout. Passed on to the gesture detector.
+     */
+    var isTapZone: ((MotionEvent) -> Boolean)? = null
+        set(value) {
+            field = value
+            gestureDetector.isTapZone = value
+        }
 
     /**
      * Whether the gesture detector is currently enabled.

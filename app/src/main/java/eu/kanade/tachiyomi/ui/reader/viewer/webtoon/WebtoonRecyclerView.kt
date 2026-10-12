@@ -48,6 +48,12 @@ class WebtoonRecyclerView @JvmOverloads constructor(
     private val listener = GestureListener()
     private val detector = Detector()
 
+    var isTapZone: ((MotionEvent) -> Boolean)? = null
+        set(value) {
+            field = value
+            detector.isTapZone = value
+        }
+
     var sidePaddingPercent = 0
         set(value) {
             field = value
@@ -243,7 +249,8 @@ class WebtoonRecyclerView @JvmOverloads constructor(
     inner class GestureListener : GestureDetectorWithLongTap.Listener() {
 
         override fun onSingleTapConfirmed(ev: MotionEvent): Boolean {
-            if (!tapDuringManualScroll) {
+            // Already invoked when the finger was lifted, on a tap zone
+            if (!tapDuringManualScroll && !detector.isHandledByImmediateTap(ev)) {
                 tapListener?.invoke(ev)
             }
             return false
@@ -347,7 +354,8 @@ class WebtoonRecyclerView @JvmOverloads constructor(
                     }
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (isDoubleTapping && !isQuickScaling) {
+                    // A tap zone touch was already spent on scrolling, it must not zoom as well
+                    if (isDoubleTapping && !isQuickScaling && !isTapZoneTouch) {
                         listener.onDoubleTapConfirmed(ev)
                     }
                     isZoomDragging = false

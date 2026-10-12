@@ -100,21 +100,16 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         pager.adapter = adapter
         pager.addOnPageChangeListener(pagerListener)
         pager.tapListener = { event ->
-            val viewPosition = IntArray(2)
-            pager.getLocationOnScreen(viewPosition)
-            val viewPositionRelativeToWindow = IntArray(2)
-            pager.getLocationInWindow(viewPositionRelativeToWindow)
-            val pos = PointF(
-                (event.rawX - viewPosition[0] + viewPositionRelativeToWindow[0]) / pager.width,
-                (event.rawY - viewPosition[1] + viewPositionRelativeToWindow[1]) / pager.height,
-            )
-            when (config.navigator.getAction(pos)) {
+            when (config.navigator.getAction(tapPosition(event))) {
                 NavigationRegion.MENU -> activity.toggleMenu()
                 NavigationRegion.NEXT -> moveToNext()
                 NavigationRegion.PREV -> moveToPrevious()
                 NavigationRegion.RIGHT -> moveRight()
                 NavigationRegion.LEFT -> moveLeft()
             }
+        }
+        pager.isTapZone = { event ->
+            config.tapZonesImmediate && isTapZone(event)
         }
         pager.longTapListener = f@{
             if (activity.viewModel.state.value.menuVisible || config.longTapEnabled) {
@@ -394,6 +389,29 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
      */
     protected open fun moveDown() {
         moveToNext()
+    }
+
+    /**
+     * Where the given touch event landed on the pager, as a point in the [0, 1] range the
+     * navigation regions are described in.
+     */
+    private fun tapPosition(event: MotionEvent): PointF {
+        val viewPosition = IntArray(2)
+        pager.getLocationOnScreen(viewPosition)
+        val viewPositionRelativeToWindow = IntArray(2)
+        pager.getLocationInWindow(viewPositionRelativeToWindow)
+        return PointF(
+            (event.rawX - viewPosition[0] + viewPositionRelativeToWindow[0]) / pager.width,
+            (event.rawY - viewPosition[1] + viewPositionRelativeToWindow[1]) / pager.height,
+        )
+    }
+
+    /**
+     * Whether the given touch event landed on a tap zone, i.e. somewhere a tap is acted on
+     * instead of being spent on zooming the image.
+     */
+    fun isTapZone(event: MotionEvent): Boolean {
+        return config.navigator.getAction(tapPosition(event)) != NavigationRegion.MENU
     }
 
     /**

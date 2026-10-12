@@ -131,6 +131,11 @@ private fun ColumnScope.PagerViewerSettings(viewModel: ReaderSettingsViewModel) 
         onSelectInvertMode = viewModel.preferences.pagerNavInverted::set,
     )
 
+    CheckboxItem(
+        label = stringResource(MR.strings.pref_tap_zones_immediate),
+        pref = viewModel.preferences.tapZonesImmediate,
+    )
+
     val imageScaleType by viewModel.preferences.imageScaleType.collectAsState()
     SettingsChipRow(MR.strings.pref_image_scale_type) {
         ReaderPreferences.ImageScaleType.mapIndexed { index, it ->
@@ -208,6 +213,11 @@ private fun ColumnScope.WebtoonViewerSettings(viewModel: ReaderSettingsViewModel
         onSelect = viewModel.preferences.navigationModeWebtoon::set,
         invertMode = webtoonNavInverted,
         onSelectInvertMode = viewModel.preferences.webtoonNavInverted::set,
+    )
+
+    CheckboxItem(
+        label = stringResource(MR.strings.pref_tap_zones_immediate),
+        pref = viewModel.preferences.tapZonesImmediate,
     )
 
     val webtoonSidePadding by viewModel.preferences.webtoonSidePadding.collectAsState()

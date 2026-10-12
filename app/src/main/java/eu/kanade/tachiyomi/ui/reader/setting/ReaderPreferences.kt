@@ -202,6 +202,8 @@ class ReaderPreferences(
         false,
     )
 
+    val tapZonesImmediate: Preference<Boolean> = preferenceStore.getBoolean("reader_tap_zones_immediate", false)
+
     // endregion
 
     // region WebGpu

@@ -18,6 +18,7 @@ abstract class ViewerConfig(readerPreferences: ReaderPreferences, private val sc
 
     var tappingInverted = ReaderPreferences.TappingInvertMode.NONE
     var longTapEnabled = true
+    var tapZonesImmediate = false
     var usePageTransitions = false
     var doubleTapAnimDuration = 500
     var volumeKeysEnabled = false
@@ -48,6 +49,9 @@ abstract class ViewerConfig(readerPreferences: ReaderPreferences, private val sc
     init {
         readerPreferences.readWithLongTap
             .register({ longTapEnabled = it })
+
+        readerPreferences.tapZonesImmediate
+            .register({ tapZonesImmediate = it })
 
         readerPreferences.pageTransitions
             .register({ usePageTransitions = it })

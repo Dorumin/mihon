@@ -74,6 +74,18 @@ open class ReaderPageImageView @JvmOverloads constructor(
      */
     var pageBackground: Drawable? = null
 
+    /**
+     * Whether a touch on the given on down event landed where the reader wants a tap, in which
+     * case a double tap must not zoom the image. Set by the page holder, the only one that knows
+     * where its tap zones are.
+     */
+    var isDoubleTapZoomSuppressed: ((MotionEvent) -> Boolean)? = null
+
+    /**
+     * Whether zoom is turned off for the touch in progress, to be restored when it ends.
+     */
+    private var isZoomSuppressed = false
+
     @CallSuper
     open fun onImageLoaded() {
         onImageLoaded?.invoke()
@@ -235,6 +247,34 @@ open class ReaderPageImageView @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Turns zoom off on the image for the whole of a touch that started on a tap zone, so fast
+     * tapping there only turns pages and never zooms. The flag has to be set before the event is
+     * passed on, because the image reads it while handling that very same event.
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (isDoubleTapZoomSuppressed?.invoke(ev) == true) {
+                    (pageView as? SubsamplingScaleImageView)?.let { view ->
+                        view.setZoomEnabled(false)
+                        isZoomSuppressed = true
+                    }
+                }
+            }
+            // A second finger means it's not a tap, so there's nothing left to suppress
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (isZoomSuppressed) {
+                    (pageView as? SubsamplingScaleImageView)?.let { view ->
+                        view.setZoomEnabled(true)
+                    }
+                    isZoomSuppressed = false
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     private fun prepareNonAnimatedImageView() {
         if (pageView is SubsamplingScaleImageView) return
         removeView(pageView)
@@ -371,6 +411,9 @@ open class ReaderPageImageView @JvmOverloads constructor(
                 setOnDoubleTapListener(
                     object : GestureDetector.SimpleOnGestureListener() {
                         override fun onDoubleTap(e: MotionEvent): Boolean {
+                            if (this@ReaderPageImageView.isDoubleTapZoomSuppressed?.invoke(e) == true) {
+                                return true
+                            }
                             if (scale > 1F) {
                                 setScale(1F, e.x, e.y, true)
                             } else {

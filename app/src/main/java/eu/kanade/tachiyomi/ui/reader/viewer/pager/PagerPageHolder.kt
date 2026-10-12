@@ -63,6 +63,10 @@ class PagerPageHolder(
 
     init {
         loadJob = scope.launch { loadPageAndProcessStatus() }
+        // A double tap on a tap zone turns pages, so it must not be spent on zooming the image
+        isDoubleTapZoomSuppressed = { event ->
+            viewer.config.tapZonesImmediate && viewer.isTapZone(event)
+        }
     }
 
     /**

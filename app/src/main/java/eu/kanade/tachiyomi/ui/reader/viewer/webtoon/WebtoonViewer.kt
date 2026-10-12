@@ -107,19 +107,14 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
             },
         )
         recycler.tapListener = { event ->
-            val viewPosition = IntArray(2)
-            recycler.getLocationOnScreen(viewPosition)
-            val viewPositionRelativeToWindow = IntArray(2)
-            recycler.getLocationInWindow(viewPositionRelativeToWindow)
-            val pos = PointF(
-                (event.rawX - viewPosition[0] + viewPositionRelativeToWindow[0]) / recycler.width,
-                (event.rawY - viewPosition[1] + viewPositionRelativeToWindow[1]) / recycler.originalHeight,
-            )
-            when (config.navigator.getAction(pos)) {
+            when (config.navigator.getAction(tapPosition(event))) {
                 NavigationRegion.MENU -> activity.toggleMenu()
                 NavigationRegion.NEXT, NavigationRegion.RIGHT -> scrollDown()
                 NavigationRegion.PREV, NavigationRegion.LEFT -> scrollUp()
             }
+        }
+        recycler.isTapZone = { event ->
+            config.tapZonesImmediate && isTapZone(event)
         }
         recycler.longTapListener = f@{ event ->
             if (activity.viewModel.state.value.menuVisible || config.longTapEnabled) {
@@ -290,6 +285,30 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
                 is ChapterTransition -> onTransitionSelected(item)
             }
         }
+    }
+
+    /**
+     * Where the given touch event landed on the recycler, as a point in the [0, 1] range the
+     * navigation regions are described in. The height is the unzoomed one, so the zones stay where
+     * the user expects them while the strip is zoomed out.
+     */
+    private fun tapPosition(event: MotionEvent): PointF {
+        val viewPosition = IntArray(2)
+        recycler.getLocationOnScreen(viewPosition)
+        val viewPositionRelativeToWindow = IntArray(2)
+        recycler.getLocationInWindow(viewPositionRelativeToWindow)
+        return PointF(
+            (event.rawX - viewPosition[0] + viewPositionRelativeToWindow[0]) / recycler.width,
+            (event.rawY - viewPosition[1] + viewPositionRelativeToWindow[1]) / recycler.originalHeight,
+        )
+    }
+
+    /**
+     * Whether the given touch event landed on a tap zone, i.e. somewhere a tap is acted on
+     * instead of being spent on zooming the strip.
+     */
+    private fun isTapZone(event: MotionEvent): Boolean {
+        return config.navigator.getAction(tapPosition(event)) != NavigationRegion.MENU
     }
 
     /**

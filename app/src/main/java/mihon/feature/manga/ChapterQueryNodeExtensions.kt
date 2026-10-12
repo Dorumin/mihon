@@ -89,12 +89,10 @@ private fun ComparisonQueryNode.matches(chapter: Chapter): Boolean {
         return queryComparator.apply(number, wanted)
     }
 
-    // -1 is how the model spells an upload date the source never gave
-    fun compareDates(timestamp: Long): Boolean? {
-        if (timestamp == -1L) return null
+    // A chapter the source never gave an upload date for has no date to compare, so it belongs to no range
+    fun compareDates(uploadTime: Instant?): Boolean? {
+        val uploadDate = uploadTime?.toLocalDateTime(TimeZone.currentSystemDefault())?.date ?: return null
         val inputDate = runCatching { LocalDate.parse(value) }.getOrNull() ?: return null
-        val uploadDate = Instant.fromEpochMilliseconds(timestamp)
-            .toLocalDateTime(TimeZone.currentSystemDefault()).date
         return queryComparator.apply(uploadDate, inputDate)
     }
 

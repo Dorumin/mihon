@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.data.download
 
+import android.content.ContentResolver
 import android.content.Context
 import com.hippo.unifile.UniFile
 import dev.zacsweers.metro.AppScope
@@ -8,6 +9,11 @@ import dev.zacsweers.metro.SingleIn
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.util.lang.Hash.md5
 import eu.kanade.tachiyomi.util.storage.DiskUtil
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import logcat.LogPriority
 import tachiyomi.core.common.i18n.stringResource
 import tachiyomi.core.common.storage.displayablePath
@@ -42,7 +48,10 @@ class DownloadProvider(
      * @param mangaTitle the title of the manga to query.
      * @param source the source of the manga.
      */
-    internal fun getMangaDir(mangaTitle: String, source: Source): Result<UniFile> {
+    internal suspend fun getMangaDir(mangaTitle: String, source: Source): Result<UniFile> =
+        withContext(Dispatchers.IO) { createMangaDir(mangaTitle, source) }
+
+    private fun createMangaDir(mangaTitle: String, source: Source): Result<UniFile> {
         val downloadsDir = downloadsDir
         if (downloadsDir == null) {
             logcat(LogPriority.ERROR) { "Failed to create download directory" }
@@ -79,8 +88,8 @@ class DownloadProvider(
      *
      * @param source the source to query.
      */
-    fun findSourceDir(source: Source): UniFile? {
-        return downloadsDir?.findFile(getSourceDirName(source))
+    suspend fun findSourceDir(source: Source): UniFile? = withContext(Dispatchers.IO) {
+        downloadsDir?.findFile(getSourceDirName(source))
     }
 
     /**
@@ -89,9 +98,8 @@ class DownloadProvider(
      * @param mangaTitle the title of the manga to query.
      * @param source the source of the manga.
      */
-    fun findMangaDir(mangaTitle: String, source: Source): UniFile? {
-        val sourceDir = findSourceDir(source)
-        return sourceDir?.findFile(getMangaDirName(mangaTitle))
+    suspend fun findMangaDir(mangaTitle: String, source: Source): UniFile? = withContext(Dispatchers.IO) {
+        findSourceDir(source)?.findFile(getMangaDirName(mangaTitle))
     }
 
     /**
@@ -102,15 +110,15 @@ class DownloadProvider(
      * @param mangaTitle the title of the manga to query.
      * @param source the source of the chapter.
      */
-    fun findChapterDir(
+    suspend fun findChapterDir(
         chapterName: String,
         chapterScanlator: String?,
         chapterUrl: String,
         mangaTitle: String,
         source: Source,
-    ): UniFile? {
+    ): UniFile? = withContext(Dispatchers.IO) {
         val mangaDir = findMangaDir(mangaTitle, source)
-        return getValidChapterDirNames(chapterName, chapterScanlator, chapterUrl).asSequence()
+        getValidChapterDirNames(chapterName, chapterScanlator, chapterUrl).asSequence()
             .mapNotNull { mangaDir?.findFile(it) }
             .firstOrNull()
     }
@@ -122,13 +130,66 @@ class DownloadProvider(
      * @param manga the manga of the chapter.
      * @param source the source of the chapter.
      */
-    fun findChapterDirs(chapters: List<Chapter>, manga: Manga, source: Source): Pair<UniFile?, List<UniFile>> {
-        val mangaDir = findMangaDir(manga.title, source) ?: return null to emptyList()
-        return mangaDir to chapters.mapNotNull { chapter ->
-            getValidChapterDirNames(chapter.name, chapter.scanlator, chapter.url).asSequence()
-                .mapNotNull { mangaDir.findFile(it) }
-                .firstOrNull()
+    suspend fun findChapterDirs(
+        chapters: List<Chapter>,
+        manga: Manga,
+        source: Source,
+    ): Pair<UniFile?, List<UniFile>> = withContext(Dispatchers.IO) {
+        val mangaDir = findMangaDir(manga.title, source) ?: return@withContext null to emptyList()
+        mangaDir to findChapterDirs(chapters, mangaDir).values.toList()
+    }
+
+    /**
+     * Returns the ids of the chapters whose download directory exists.
+     *
+     * @param chapters the chapters to query.
+     * @param manga the manga of the chapters.
+     * @param source the source of the chapters.
+     */
+    suspend fun findDownloadedChapterIds(
+        chapters: List<Chapter>,
+        manga: Manga,
+        source: Source,
+    ): Set<Long> = withContext(Dispatchers.IO) {
+        val mangaDir = findMangaDir(manga.title, source) ?: return@withContext emptySet()
+        findChapterDirs(chapters, mangaDir).keys
+    }
+
+    /**
+     * Returns the download directory of each chapter that has one, keyed by chapter id.
+     *
+     * A chapter is looked for under every name it may have been downloaded with, with the chapters looked up in
+     * parallel. On a storage access framework directory each lookup is a content resolver query, so from
+     * [LIST_CHAPTER_DIRS_MIN_CHAPTERS] chapters on the directory is listed once instead and the names are matched
+     * against the listing, ignoring case as the lookups do. Plain file directories are always looked up by name, as
+     * their listing can leave out files another app created.
+     *
+     * @param chapters the chapters to query.
+     * @param mangaDir the download directory of the chapters' manga.
+     */
+    private suspend fun findChapterDirs(chapters: List<Chapter>, mangaDir: UniFile): Map<Long, UniFile> {
+        val isDocumentTree = mangaDir.uri.scheme == ContentResolver.SCHEME_CONTENT
+        if (isDocumentTree && chapters.size >= LIST_CHAPTER_DIRS_MIN_CHAPTERS) {
+            val chapterDirs = mangaDir.listFiles().orEmpty()
+                .filter { it.name != null }
+                .associateByTo(sortedMapOf(String.CASE_INSENSITIVE_ORDER)) { it.name!! }
+            return chapters
+                .mapNotNull { chapter -> chapter.findDir { chapterDirs[it] }?.let { chapter.id to it } }
+                .toMap()
         }
+        return coroutineScope {
+            chapters
+                .map { chapter ->
+                    async(chapterDirLookupDispatcher) { chapter.findDir(mangaDir::findFile)?.let { chapter.id to it } }
+                }
+                .awaitAll()
+                .filterNotNull()
+                .toMap()
+        }
+    }
+
+    private fun Chapter.findDir(find: (String) -> UniFile?): UniFile? {
+        return getValidChapterDirNames(name, scanlator, url).firstNotNullOfOrNull(find)
     }
 
     /**
@@ -261,6 +322,12 @@ class DownloadProvider(
         }.distinct()
     }
 }
+
+private const val LIST_CHAPTER_DIRS_MIN_CHAPTERS = 50
+
+private const val CHAPTER_DIR_LOOKUP_PARALLELISM = 8
+
+private val chapterDirLookupDispatcher = Dispatchers.IO.limitedParallelism(CHAPTER_DIR_LOOKUP_PARALLELISM)
 
 /**
  * The parts of a chapter's directory name, each computed once however many name variations are built from them.

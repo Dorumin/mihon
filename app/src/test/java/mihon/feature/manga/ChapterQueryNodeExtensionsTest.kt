@@ -204,10 +204,8 @@ private fun chapter(
 ): Chapter = Chapter.create().copy(
     name = name,
     chapterNumber = number,
-    // -1 is how the model spells "the source did not give an upload date"
-    dateUpload = uploadDate?.let {
-        LocalDate.parse(it).atStartOfDayIn(TimeZone.currentSystemDefault()).toEpochMilliseconds()
-    } ?: -1L,
+    // an upload date the source never gave is nothing at all in the model
+    dateUpload = uploadDate?.let { LocalDate.parse(it).atStartOfDayIn(TimeZone.currentSystemDefault()) },
     scanlator = scanlator,
     read = read,
     bookmark = bookmark,
@@ -219,5 +217,4 @@ private fun item(
 ): ChapterList.Item = ChapterList.Item(
     chapter = chapter,
     downloadState = downloadState,
-    downloadProgress = 0,
 )

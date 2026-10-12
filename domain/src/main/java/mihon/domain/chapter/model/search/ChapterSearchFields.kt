@@ -10,6 +10,7 @@ package mihon.domain.chapter.model.search
 enum class ChapterField(vararg val aliases: String) {
     NAME("name", "title"),
     SCANLATOR("scanlator", "group", "scanlation", "gl"),
+
     // Boolean fields. An empty or truthy value asks for the flag to be set, e.g. "unread:true".
     UNREAD("unread"),
     BOOKMARKED("bookmarked", "bookmark"),
@@ -27,6 +28,7 @@ enum class ChapterField(vararg val aliases: String) {
 
 enum class ChapterComparisonField(vararg val aliases: String) {
     NUMBER("number", "num", "ch", "chapter_number"),
+
     // Compared against "yyyy-MM-dd" values, like every other date field in a query.
     DATE("date", "uploaded", "upload"),
     ;

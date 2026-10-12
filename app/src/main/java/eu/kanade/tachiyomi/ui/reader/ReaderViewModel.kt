@@ -69,6 +69,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import logcat.LogPriority
+import mihon.domain.search.QueryNode
+import mihon.feature.manga.matches
 import tachiyomi.core.common.preference.toggle
 import tachiyomi.core.common.util.lang.launchIO
 import tachiyomi.core.common.util.lang.launchNonCancellable
@@ -78,6 +80,7 @@ import tachiyomi.core.common.util.system.logcat
 import tachiyomi.domain.chapter.interactor.GetChaptersByMangaId
 import tachiyomi.domain.chapter.interactor.UpdateChapter
 import tachiyomi.domain.chapter.model.ChapterUpdate
+import tachiyomi.domain.chapter.service.calculateChapterGap
 import tachiyomi.domain.chapter.service.getChapterSort
 import tachiyomi.domain.download.service.DownloadPreferences
 import tachiyomi.domain.history.interactor.GetNextChapters
@@ -144,6 +147,13 @@ class ReaderViewModel(
     private val initialChapterId = savedState.get<Long>("chapter") ?: -1L
 
     val hasValidArgs = mangaId != -1L && initialChapterId != -1L
+
+    /**
+     * The chapter search the manga screen had open when it opened this reader, taken from the
+     * activity intent. It is left out of the saved state on purpose: it is meant to be used and
+     * dropped, like the search bar it came from.
+     */
+    private val searchQuery = savedState.get<String>("search")
 
     private val eventChannel = Channel<Event>()
     val eventFlow = eventChannel.receiveAsFlow()
@@ -213,9 +223,30 @@ class ReaderViewModel(
         val selectedChapter = chapters.find { it.id == chapterId }
             ?: error("Requested chapter of id $chapterId not found in chapter list")
 
+        // A search the manga screen had open narrows the reader alike, so it keeps browsing the
+        // chapters that matched instead of the whole entry. The chapter the reader was opened on
+        // stays either way, as a reader has to be reading something.
+        val searchNode = searchQuery?.let { QueryNode.from(it) }
+        val visibleChapters = if (searchNode == null) {
+            chapters
+        } else {
+            chapters.filter {
+                searchNode.matches(
+                    it,
+                    downloadCache.isChapterDownloaded(it.name, it.scanlator, it.url, manga.title, manga.source),
+                )
+            }.let { matched ->
+                if (matched.any { it.id == chapterId }) {
+                    matched
+                } else {
+                    matched + listOf(selectedChapter)
+                }
+            }
+        }
+
         val chaptersForReader = when {
             (readerPreferences.skipRead.get() || readerPreferences.skipFiltered.get()) -> {
-                val filteredChapters = chapters.filterNot {
+                val filteredChapters = visibleChapters.filterNot {
                     when {
                         readerPreferences.skipRead.get() && it.read -> true
                         readerPreferences.skipFiltered.get() -> {
@@ -254,7 +285,7 @@ class ReaderViewModel(
                     filteredChapters + listOf(selectedChapter)
                 }
             }
-            else -> chapters
+            else -> visibleChapters
         }
 
         chaptersForReader
@@ -346,6 +377,25 @@ class ReaderViewModel(
     }
 
     /**
+     * Chapters the source does not have between two chapters the reader shows next to each other.
+     * The reader's own list leaves chapters out for its own reasons, so the count is taken over
+     * everything the source has and only what the source is short of is left as missing. A jump
+     * that skipped nothing of the source's own is a plain page turn, with no screen of its own.
+     */
+    private fun missingFromSource(higherChapter: ReaderChapter?, lowerChapter: ReaderChapter?): Int {
+        val higherNumber = higherChapter?.chapter?.toDomainChapter()?.chapterNumber ?: return 0
+        val lowerNumber = lowerChapter?.chapter?.toDomainChapter()?.chapterNumber ?: 0.0
+        val gap = calculateChapterGap(higherNumber, lowerNumber)
+        if (gap <= 0) return 0
+
+        // What the source does have in the hole, which the reader left out for its own reasons
+        val leftOutByReader = unfilteredChapterList.count {
+            it.isRecognizedNumber && it.chapterNumber > lowerNumber && it.chapterNumber < higherNumber
+        }
+        return (gap - leftOutByReader).coerceAtLeast(0)
+    }
+
+    /**
      * Loads the given [chapter] with this [loader] and updates the currently active chapters.
      * Callers must handle errors.
      */
@@ -356,10 +406,14 @@ class ReaderViewModel(
         loader.loadChapter(chapter)
 
         val chapterPos = chapterList.indexOf(chapter)
+        val prevChapter = chapterList.getOrNull(chapterPos - 1)
+        val nextChapter = chapterList.getOrNull(chapterPos + 1)
         val newChapters = ViewerChapters(
-            chapter,
-            chapterList.getOrNull(chapterPos - 1),
-            chapterList.getOrNull(chapterPos + 1),
+            currChapter = chapter,
+            prevChapter = prevChapter,
+            nextChapter = nextChapter,
+            prevMissingCount = missingFromSource(chapter, prevChapter),
+            nextMissingCount = missingFromSource(nextChapter, chapter),
         )
 
         withUIContext {

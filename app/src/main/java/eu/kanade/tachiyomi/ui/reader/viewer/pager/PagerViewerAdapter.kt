@@ -50,9 +50,17 @@ class PagerViewerAdapter(private val viewer: PagerViewer) : ViewPagerAdapter() {
     fun setChapters(chapters: ViewerChapters, forceTransition: Boolean) {
         val newItems = mutableListOf<Any>()
 
-        // Forces chapter transition if there is missing chapters
-        val prevHasMissingChapters = calculateChapterGap(chapters.currChapter, chapters.prevChapter) > 0
-        val nextHasMissingChapters = calculateChapterGap(chapters.nextChapter, chapters.currChapter) > 0
+        // Whether the jump left chapters out at all, whatever the reason
+        val prevSkipped = calculateChapterGap(chapters.currChapter, chapters.prevChapter) > 0
+        val nextSkipped = calculateChapterGap(chapters.nextChapter, chapters.currChapter) > 0
+
+        // Chapters the source itself is short of, which the reader was told of. A jump that skipped
+        // nothing of the source's own only walked past the reader's filters, so it is a plain page
+        // turn: it gets no screen of its own, and the "always show" setting does not add one.
+        val prevHasMissingChapters = chapters.prevMissingCount > 0
+        val nextHasMissingChapters = chapters.nextMissingCount > 0
+        val prevForced = forceTransition && !(prevSkipped && !prevHasMissingChapters)
+        val nextForced = forceTransition && !(nextSkipped && !nextHasMissingChapters)
 
         // Add previous chapter pages and transition
         chapters.prevChapter?.pages?.let(newItems::addAll)
@@ -60,7 +68,7 @@ class PagerViewerAdapter(private val viewer: PagerViewer) : ViewPagerAdapter() {
         // Skip transition page if the chapter is loaded & current page is not a transition page
         prevTransition = ChapterTransition.Prev(chapters.currChapter, chapters.prevChapter)
             .also {
-                if (prevHasMissingChapters || forceTransition ||
+                if (prevHasMissingChapters || prevForced ||
                     chapters.prevChapter?.state !is ReaderChapter.State.Loaded
                 ) {
                     newItems.add(it)
@@ -95,7 +103,7 @@ class PagerViewerAdapter(private val viewer: PagerViewer) : ViewPagerAdapter() {
             .also {
                 if (
                     nextHasMissingChapters ||
-                    forceTransition ||
+                    nextForced ||
                     chapters.nextChapter?.state !is ReaderChapter.State.Loaded
                 ) {
                     newItems.add(it)

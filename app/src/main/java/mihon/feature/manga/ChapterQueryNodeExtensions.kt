@@ -14,24 +14,32 @@ import mihon.domain.search.GeneralQueryNode
 import mihon.domain.search.NotNode
 import mihon.domain.search.OrNode
 import mihon.domain.search.QueryNode
+import tachiyomi.domain.chapter.model.Chapter
 import kotlin.time.Instant
 
 /** Matches a search query against a chapter of the opened entry. */
-fun QueryNode.matches(item: ChapterList.Item): Boolean {
+fun QueryNode.matches(item: ChapterList.Item): Boolean = matches(item.chapter, item.isDownloaded)
+
+/**
+ * Matches a search query against a chapter on its own, for callers that hold chapters without a
+ * row around them. The download state is asked for instead of read off a row, as a chapter alone
+ * does not know whether it was downloaded.
+ */
+fun QueryNode.matches(chapter: Chapter, isDownloaded: Boolean): Boolean {
     return when (this) {
-        is AndNode -> children.all { it.matches(item) }
-        is OrNode -> children.any { it.matches(item) }
-        is NotNode -> !child.matches(item)
+        is AndNode -> children.all { it.matches(chapter, isDownloaded) }
+        is OrNode -> children.any { it.matches(chapter, isDownloaded) }
+        is NotNode -> !child.matches(chapter, isDownloaded)
         is EmptyQueryNode -> true
-        is GeneralQueryNode -> matches(item)
-        is FieldQueryNode -> matches(item)
-        is ComparisonQueryNode -> matches(item)
+        is GeneralQueryNode -> matches(chapter)
+        is FieldQueryNode -> matches(chapter, isDownloaded)
+        is ComparisonQueryNode -> matches(chapter)
     }
 }
 
-private fun chapterMatches(item: ChapterList.Item, text: String): Boolean =
-    item.chapter.name.contains(text, ignoreCase = true) ||
-        (item.chapter.scanlator?.contains(text, ignoreCase = true) ?: false)
+private fun chapterMatches(chapter: Chapter, text: String): Boolean =
+    chapter.name.contains(text, ignoreCase = true) ||
+        (chapter.scanlator?.contains(text, ignoreCase = true) ?: false)
 
 // Asks whether a flag is wanted, so that "unread:true" and a bare "unread:" both mean unread.
 private fun isRequested(value: String): Boolean =
@@ -40,43 +48,43 @@ private fun isRequested(value: String): Boolean =
         value.equals("yes", ignoreCase = true) ||
         value == "1"
 
-private fun GeneralQueryNode.matches(item: ChapterList.Item): Boolean {
-    val match = chapterMatches(item, value)
+private fun GeneralQueryNode.matches(chapter: Chapter): Boolean {
+    val match = chapterMatches(chapter, value)
     return if (negated) !match else match
 }
 
-private fun FieldQueryNode.matches(item: ChapterList.Item): Boolean {
+private fun FieldQueryNode.matches(chapter: Chapter, isDownloaded: Boolean): Boolean {
     val match = when (ChapterField.fromString(field)) {
         ChapterField.NAME ->
             if (value.isEmpty()) {
-                item.chapter.name.isEmpty()
+                chapter.name.isEmpty()
             } else {
-                item.chapter.name.contains(value, ignoreCase = true)
+                chapter.name.contains(value, ignoreCase = true)
             }
 
         ChapterField.SCANLATOR ->
             if (value.isEmpty()) {
-                item.chapter.scanlator.isNullOrEmpty()
+                chapter.scanlator.isNullOrEmpty()
             } else {
-                item.chapter.scanlator?.contains(value, ignoreCase = true) ?: false
+                chapter.scanlator?.contains(value, ignoreCase = true) ?: false
             }
 
-        ChapterField.UNREAD -> isRequested(value) == !item.chapter.read
-        ChapterField.BOOKMARKED -> isRequested(value) == item.chapter.bookmark
-        ChapterField.DOWNLOADED -> isRequested(value) == item.isDownloaded
+        ChapterField.UNREAD -> isRequested(value) == !chapter.read
+        ChapterField.BOOKMARKED -> isRequested(value) == chapter.bookmark
+        ChapterField.DOWNLOADED -> isRequested(value) == isDownloaded
 
         // Not a chapter field, so "titel:foo" is better off searching for that text than matching nothing
-        null -> chapterMatches(item, "$field:$value")
+        null -> chapterMatches(chapter, "$field:$value")
     }
     return if (negated) !match else match
 }
 
-private fun ComparisonQueryNode.matches(item: ChapterList.Item): Boolean {
+private fun ComparisonQueryNode.matches(chapter: Chapter): Boolean {
     // A comparison asks whether a chapter's own value falls in a range. Where the chapter has no
     // value, the answer is not "the lowest" or "the highest" but no answer at all, so such a chapter
     // is left out of the range and out of its negation alike, as a null is left out by a SQL engine.
     fun compareNumbers(number: Double): Boolean? {
-        if (!item.chapter.isRecognizedNumber) return null
+        if (!chapter.isRecognizedNumber) return null
         val wanted = value.toDoubleOrNull() ?: return null
         return queryComparator.apply(number, wanted)
     }
@@ -91,11 +99,11 @@ private fun ComparisonQueryNode.matches(item: ChapterList.Item): Boolean {
     }
 
     val match = when (ChapterComparisonField.fromString(field)) {
-        ChapterComparisonField.NUMBER -> compareNumbers(item.chapter.chapterNumber)
-        ChapterComparisonField.DATE -> compareDates(item.chapter.dateUpload)
+        ChapterComparisonField.NUMBER -> compareNumbers(chapter.chapterNumber)
+        ChapterComparisonField.DATE -> compareDates(chapter.dateUpload)
 
         // Not a chapter field, so "foo>bar" is better off searching for that text than matching nothing
-        null -> chapterMatches(item, "$field${queryComparator.symbol}$value")
+        null -> chapterMatches(chapter, "$field${queryComparator.symbol}$value")
     }
     // a chapter with nothing to compare belongs to no range, not even the negation of one
     return match?.let { if (negated) !it else it } ?: false

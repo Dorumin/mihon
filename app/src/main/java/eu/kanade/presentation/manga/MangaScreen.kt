@@ -46,6 +46,7 @@ import androidx.compose.ui.util.fastAny
 import androidx.compose.ui.util.fastMap
 import eu.kanade.presentation.components.relativeDateText
 import eu.kanade.presentation.manga.components.ChapterDownloadAction
+import eu.kanade.presentation.manga.components.ChapterGapListItem
 import eu.kanade.presentation.manga.components.ChapterHeader
 import eu.kanade.presentation.manga.components.ExpandableMangaDescription
 import eu.kanade.presentation.manga.components.MangaActionRow
@@ -53,7 +54,6 @@ import eu.kanade.presentation.manga.components.MangaBottomActionMenu
 import eu.kanade.presentation.manga.components.MangaChapterListItem
 import eu.kanade.presentation.manga.components.MangaInfoBox
 import eu.kanade.presentation.manga.components.MangaToolbar
-import eu.kanade.presentation.manga.components.MissingChapterCountListItem
 import eu.kanade.presentation.util.formatChapterNumber
 import eu.kanade.tachiyomi.data.download.model.Download
 import eu.kanade.tachiyomi.source.getNameForMangaInfo
@@ -63,7 +63,6 @@ import eu.kanade.tachiyomi.util.system.copyToClipboard
 import mihon.icons.materialsymbols.MaterialSymbols
 import mihon.icons.materialsymbols.roundedfilled.PlayArrow
 import tachiyomi.domain.chapter.model.Chapter
-import tachiyomi.domain.chapter.service.missingChaptersCount
 import tachiyomi.domain.library.service.LibraryPreferences
 import tachiyomi.domain.manga.model.Manga
 import tachiyomi.domain.source.model.StubSource
@@ -440,13 +439,10 @@ private fun MangaScreenSmallImpl(
                         key = MangaScreenItem.CHAPTER_HEADER,
                         contentType = MangaScreenItem.CHAPTER_HEADER,
                     ) {
-                        val missingChapterCount = remember(chapters) {
-                            chapters.map { it.chapter.chapterNumber }.missingChaptersCount()
-                        }
                         ChapterHeader(
                             enabled = !isAnySelected,
                             chapterCount = chapters.size,
-                            missingChapterCount = missingChapterCount,
+                            missingChapterCount = state.missingChaptersCount,
                             onClick = onFilterClicked,
                         )
                     }
@@ -687,13 +683,10 @@ fun MangaScreenLargeImpl(
                                 key = MangaScreenItem.CHAPTER_HEADER,
                                 contentType = MangaScreenItem.CHAPTER_HEADER,
                             ) {
-                                val missingChapterCount = remember(chapters) {
-                                    chapters.map { it.chapter.chapterNumber }.missingChaptersCount()
-                                }
                                 ChapterHeader(
                                     enabled = !isAnySelected,
                                     chapterCount = chapters.size,
-                                    missingChapterCount = missingChapterCount,
+                                    missingChapterCount = state.missingChaptersCount,
                                     onClick = onFilterButtonClicked,
                                 )
                             }
@@ -775,6 +768,7 @@ private fun LazyListScope.sharedChapterItems(
         key = { item ->
             when (item) {
                 is ChapterList.MissingCount -> "missing-count-${item.id}"
+                is ChapterList.FilteredCount -> "filtered-count-${item.id}"
                 is ChapterList.Item -> "chapter-${item.id}"
             }
         },
@@ -784,7 +778,10 @@ private fun LazyListScope.sharedChapterItems(
 
         when (item) {
             is ChapterList.MissingCount -> {
-                MissingChapterCountListItem(count = item.count)
+                ChapterGapListItem(count = item.count)
+            }
+            is ChapterList.FilteredCount -> {
+                ChapterGapListItem(count = item.count, filtered = true)
             }
             is ChapterList.Item -> {
                 MangaChapterListItem(

@@ -90,6 +90,7 @@ import tachiyomi.domain.chapter.model.ChapterUpdate
 import tachiyomi.domain.chapter.model.NoChaptersException
 import tachiyomi.domain.chapter.service.calculateChapterGap
 import tachiyomi.domain.chapter.service.getChapterSort
+import tachiyomi.domain.chapter.service.missingChaptersCount
 import tachiyomi.domain.library.service.LibraryPreferences
 import tachiyomi.domain.manga.interactor.GetDuplicateLibraryManga
 import tachiyomi.domain.manga.interactor.GetMangaWithChapters
@@ -101,7 +102,6 @@ import tachiyomi.domain.source.service.SourceManager
 import tachiyomi.domain.track.interactor.GetTracks
 import tachiyomi.i18n.MR
 import tachiyomi.source.local.isLocal
-import kotlin.math.floor
 import kotlin.time.Duration.Companion.seconds
 
 @AssistedInject
@@ -1102,11 +1102,30 @@ class MangaViewModel(
                 chapters.fastAny { it.selected }
             }
 
+            /**
+             * Chapters the source does not have at all, counted over everything it has. The view's
+             * own filters leave chapters out for other reasons, and those are not missing from the
+             * manga, so they are not added to this.
+             */
+            val missingChaptersCount by lazy {
+                chapters.map { it.chapter.chapterNumber }.missingChaptersCount()
+            }
+
             val chapterListItems by lazy {
-                // A search leaves chapters out for reasons unrelated to numbering, so the gaps it leaves
-                // between matches would read as missing chapters
-                if (hideMissingChapters || !searchQuery.isNullOrBlank()) {
+                val showMissingRows = SHOW_MISSING_GAP_ROWS && !hideMissingChapters
+                val showFilteredRows = SHOW_FILTERED_GAP_ROWS
+                if (!showMissingRows && !showFilteredRows) {
                     return@lazy processedChapters
+                }
+
+                // Chapters the source does have between two chapters shown next to each other, so a
+                // hole can be told apart from a view: only what the source is short of is missing
+                val leftOutByView = { higherChapter: Chapter, lowerNumber: Double ->
+                    chapters.count {
+                        it.chapter.isRecognizedNumber &&
+                            it.chapter.chapterNumber > lowerNumber &&
+                            it.chapter.chapterNumber < higherChapter.chapterNumber
+                    }
                 }
 
                 processedChapters.insertSeparators { before, after ->
@@ -1117,21 +1136,34 @@ class MangaViewModel(
                     }
                     if (higherChapter == null) return@insertSeparators null
 
-                    if (lowerChapter == null) {
-                        floor(higherChapter.chapter.chapterNumber)
-                            .toInt()
-                            .minus(1)
-                            .coerceAtLeast(0)
-                    } else {
-                        calculateChapterGap(higherChapter.chapter, lowerChapter.chapter)
+                    // A listing that starts past the first chapter the source has is measured from
+                    // chapter 0, which is how the hole above it is counted
+                    val lowerNumber = lowerChapter?.chapter?.chapterNumber ?: 0.0
+                    val gap = calculateChapterGap(higherChapter.chapter.chapterNumber, lowerNumber)
+                    if (gap <= 0) return@insertSeparators null
+
+                    val missingFromSource = (gap - leftOutByView(higherChapter.chapter, lowerNumber))
+                        .coerceAtLeast(0)
+                    when {
+                        // A hole the source is short of is said as missing whatever else left it out,
+                        // so the view's own share of it is not said as well
+                        missingFromSource > 0 ->
+                            if (showMissingRows) {
+                                ChapterList.MissingCount(
+                                    id = "${lowerChapter?.id}-${higherChapter.id}",
+                                    count = missingFromSource,
+                                )
+                            } else {
+                                null
+                            }
+
+                        showFilteredRows -> ChapterList.FilteredCount(
+                            id = "${lowerChapter?.id}-${higherChapter.id}",
+                            count = gap - missingFromSource,
+                        )
+
+                        else -> null
                     }
-                        .takeIf { it > 0 }
-                        ?.let { missingCount ->
-                            ChapterList.MissingCount(
-                                id = "${lowerChapter?.id}-${higherChapter.id}",
-                                count = missingCount,
-                            )
-                        }
                 }
             }
 
@@ -1161,10 +1193,30 @@ class MangaViewModel(
     }
 }
 
+/**
+ * Whether the listing leaves a row where it skips chapters the manga has but the view left out.
+ * The reader browses past those on its own, so the row only says what the view already knows.
+ */
+private const val SHOW_FILTERED_GAP_ROWS = false
+
+/**
+ * Whether the listing leaves a row where the manga itself is short of chapters. Unlike the rows
+ * above, these are holes in the entry and not in the view, so they are worth saying whatever the
+ * reader does. The library's own setting hides them alike.
+ */
+private const val SHOW_MISSING_GAP_ROWS = true
+
 @Immutable
 sealed class ChapterList {
     @Immutable
     data class MissingCount(
+        val id: String,
+        val count: Int,
+    ) : ChapterList()
+
+    /** Chapters the view left out between two it shows next to each other, of a manga that has them. */
+    @Immutable
+    data class FilteredCount(
         val id: String,
         val count: Int,
     ) : ChapterList()

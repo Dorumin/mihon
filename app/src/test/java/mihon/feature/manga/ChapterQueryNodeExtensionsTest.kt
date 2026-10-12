@@ -4,9 +4,9 @@ import eu.kanade.tachiyomi.data.download.model.Download
 import eu.kanade.tachiyomi.ui.manga.ChapterList
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.shouldBe
-import kotlinx.datetime.atStartOfDayIn
 import kotlinx.datetime.LocalDate
 import kotlinx.datetime.TimeZone
+import kotlinx.datetime.atStartOfDayIn
 import mihon.domain.search.QueryNode
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.parallel.Execution
@@ -143,7 +143,8 @@ class ChapterQueryNodeExtensionsTest {
 
     @Test
     fun `a queued download is not a downloaded chapter`() {
-        matching("downloaded:false") shouldContainExactly listOf("Prologue", "Chapter 2", "Chapter 1 (MangaPlus)", "Bonus")
+        matching("downloaded:false") shouldContainExactly
+            listOf("Prologue", "Chapter 2", "Chapter 1 (MangaPlus)", "Bonus")
         matching("downloaded:false scanlator:cool") shouldContainExactly listOf("Chapter 2")
     }
 

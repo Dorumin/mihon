@@ -107,10 +107,17 @@ class ReaderActivity : BaseActivity() {
     private val graph: AppGraph by lazy { metroGraph() }
 
     companion object {
-        fun newIntent(context: Context, mangaId: Long?, chapterId: Long?): Intent {
+        fun newIntent(
+            context: Context,
+            mangaId: Long?,
+            chapterId: Long?,
+            searchQuery: String? = null,
+        ): Intent {
             return Intent(context, ReaderActivity::class.java).apply {
                 putExtra("manga", mangaId)
                 putExtra("chapter", chapterId)
+                // What the manga screen's search bar had open, so the reader browses the same set
+                searchQuery?.let { putExtra("search", it) }
                 addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
             }
         }

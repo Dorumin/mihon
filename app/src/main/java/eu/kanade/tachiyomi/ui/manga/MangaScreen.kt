@@ -111,7 +111,7 @@ class MangaScreen(
             chapterSwipeStartAction = viewModel.chapterSwipeStartAction,
             chapterSwipeEndAction = viewModel.chapterSwipeEndAction,
             navigateUp = navigator::pop,
-            onChapterClicked = { openChapter(context, it) },
+            onChapterClicked = { openChapter(context, it, successState.searchQuery) },
             onDownloadChapter = viewModel::runChapterDownloadActions.takeIf { !successState.source.isLocalOrStub() },
             onAddToLibraryClicked = {
                 viewModel.toggleFavorite()
@@ -288,8 +288,14 @@ class MangaScreen(
         if (unreadChapter != null) openChapter(context, unreadChapter)
     }
 
-    private fun openChapter(context: Context, chapter: Chapter) {
-        context.startActivity(ReaderActivity.newIntent(context, chapter.mangaId, chapter.id))
+    private fun openChapter(
+        context: Context,
+        chapter: Chapter,
+        searchQuery: String? = null,
+    ) {
+        context.startActivity(
+            ReaderActivity.newIntent(context, chapter.mangaId, chapter.id, searchQuery),
+        )
     }
 
     private fun getMangaUrl(manga_: Manga?, source_: Source?): String? {

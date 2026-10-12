@@ -17,9 +17,15 @@ import tachiyomi.presentation.core.components.material.padding
 import tachiyomi.presentation.core.i18n.pluralStringResource
 import tachiyomi.presentation.core.util.secondaryItemAlpha
 
+/**
+ * A row left where the listing skips chapters between two it shows next to each other. A manga
+ * that is short of chapters is said as missing; chapters the manga has and the view left out are
+ * said as filtered, so a reader can tell a hole in the entry from a hole in their own filters.
+ */
 @Composable
-fun MissingChapterCountListItem(
+fun ChapterGapListItem(
     count: Int,
+    filtered: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -34,7 +40,11 @@ fun MissingChapterCountListItem(
     ) {
         HorizontalDivider(modifier = Modifier.weight(1f))
         Text(
-            text = pluralStringResource(MR.plurals.missing_chapters, count = count, count),
+            text = if (filtered) {
+                pluralStringResource(MR.plurals.filtered_chapters, count = count, count)
+            } else {
+                pluralStringResource(MR.plurals.missing_chapters, count = count, count)
+            },
             style = MaterialTheme.typography.labelMedium,
         )
         HorizontalDivider(modifier = Modifier.weight(1f))
@@ -46,7 +56,7 @@ fun MissingChapterCountListItem(
 private fun Preview() {
     TachiyomiPreviewTheme {
         Surface {
-            MissingChapterCountListItem(count = 42)
+            ChapterGapListItem(count = 42)
         }
     }
 }

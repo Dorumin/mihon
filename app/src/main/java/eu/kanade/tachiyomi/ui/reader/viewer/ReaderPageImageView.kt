@@ -61,6 +61,30 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
     private var pageView: View? = null
 
+    /**
+     * A second still view, drawn over the first, that a page is brought up to the file's own detail
+     * in.
+     *
+     * A subsampling view drops whatever it was drawing the moment it is handed a new image, so
+     * promoting a page in the view that is drawing it shows the page as nothing for as long as the
+     * new source loads. Loading beside it and swapping the two over when it is ready is what keeps the
+     * page on screen. It exists only while that load runs, and is let go when it is swapped in, when
+     * it fails, and in [recycle].
+     */
+    private var detailView: SubsamplingScaleImageView? = null
+
+    /**
+     * The view a promoted page was showing before it was brought up to the file, kept aside while the
+     * file's own detail is on screen so the page can be put back when the reader moves on.
+     *
+     * It is not recycled at the swap because its pixels are the prepared ones the reader wants again
+     * the moment they stop on this page, and it is the cheap half: a bitmap the page cache already
+     * holds, against the tile pyramid over the file, which is what letting go of the detail view is
+     * for. Non-null is what says a page is currently showing the file, so it is also the flag for
+     * whether there is anything to put back.
+     */
+    private var previewView: SubsamplingScaleImageView? = null
+
     private var stripRequest: Disposable? = null
 
     private var config: Config? = null
@@ -214,6 +238,18 @@ open class ReaderPageImageView @JvmOverloads constructor(
         isImageShown = false
         stripRequest?.dispose()
         stripRequest = null
+        // A promotion that was still loading is dropped, not left waiting for a page that is gone
+        detailView?.let {
+            it.recycle()
+            removeView(it)
+        }
+        detailView = null
+        // And the prepared view that was kept out of the tree while a promoted page was on screen.
+        // It is only ever out of the tree, so there is nothing to remove here.
+        previewView?.let {
+            it.recycle()
+        }
+        previewView = null
         pageView?.let {
             when (it) {
                 is SubsamplingScaleImageView -> it.recycle()
@@ -306,27 +342,35 @@ open class ReaderPageImageView @JvmOverloads constructor(
         return super.dispatchTouchEvent(ev)
     }
 
+    /**
+     * A view that draws a still page, with the touch behaviour the reader expects of one. Made twice:
+     * for the page itself, and for the file's own detail beside it (see
+     * [promoteToFullDetail]) — the second one is zoomed and panned by the reader just like the first,
+     * so it is the same view, not a lighter one.
+     */
+    private fun newSubsamplingImageView() = SubsamplingScaleImageView(context).apply {
+        setDoubleTapZoomStyle(SubsamplingScaleImageView.ZOOM_FOCUS_CENTER)
+        setPanLimit(SubsamplingScaleImageView.PAN_LIMIT_INSIDE)
+        setMinimumTileDpi(180)
+        setOnStateChangedListener(
+            object : SubsamplingScaleImageView.OnStateChangedListener {
+                override fun onScaleChanged(newScale: Float, origin: Int) {
+                    this@ReaderPageImageView.onScaleChanged(newScale)
+                }
+
+                override fun onCenterChanged(newCenter: PointF?, origin: Int) {
+                    // Not used
+                }
+            },
+        )
+        setOnClickListener { this@ReaderPageImageView.onViewClicked() }
+    }
+
     private fun prepareNonAnimatedImageView() {
         if (pageView is SubsamplingScaleImageView) return
         removeView(pageView)
 
-        pageView = SubsamplingScaleImageView(context).apply {
-            setDoubleTapZoomStyle(SubsamplingScaleImageView.ZOOM_FOCUS_CENTER)
-            setPanLimit(SubsamplingScaleImageView.PAN_LIMIT_INSIDE)
-            setMinimumTileDpi(180)
-            setOnStateChangedListener(
-                object : SubsamplingScaleImageView.OnStateChangedListener {
-                    override fun onScaleChanged(newScale: Float, origin: Int) {
-                        this@ReaderPageImageView.onScaleChanged(newScale)
-                    }
-
-                    override fun onCenterChanged(newCenter: PointF?, origin: Int) {
-                        // Not used
-                    }
-                },
-            )
-            setOnClickListener { this@ReaderPageImageView.onViewClicked() }
-        }
+        pageView = newSubsamplingImageView()
         addView(pageView, MATCH_PARENT, MATCH_PARENT)
     }
 
@@ -343,14 +387,23 @@ open class ReaderPageImageView @JvmOverloads constructor(
         }
     }
 
-    private fun setNonAnimatedImage(
-        data: Any,
-        config: Config,
-    ) = (pageView as? SubsamplingScaleImageView)?.apply {
+    /**
+     * The zoom, scale and crop settings of a still page, applied to whichever view is drawing it.
+     * The listener for "the image is here" is not part of this: the two callers answer it differently,
+     * one by showing a page and one by swapping a page over.
+     */
+    private fun SubsamplingScaleImageView.applyImageConfig(config: Config) {
         setDoubleTapZoomDuration(config.zoomDuration.getSystemScaledDuration())
         setMinimumScaleType(config.minimumScaleType)
         setMinimumDpi(1) // Just so that very small image will be fit for initial load
         setCropBorders(config.cropBorders)
+    }
+
+    private fun setNonAnimatedImage(
+        data: Any,
+        config: Config,
+    ) = (pageView as? SubsamplingScaleImageView)?.apply {
+        applyImageConfig(config)
         setOnImageEventListener(
             object : SubsamplingScaleImageView.DefaultOnImageEventListener() {
                 override fun onReady() {
@@ -382,6 +435,117 @@ open class ReaderPageImageView @JvmOverloads constructor(
                 throw IllegalArgumentException("Not implemented for class ${data::class.simpleName}")
             }
         }
+    }
+
+    /**
+     * Brings the page up to the file's own detail without a black window. The view that is drawing it
+     * is left alone: a second view is added over it and given the file, and the two are swapped over
+     * when it is ready — the page the reader stopped on keeps what it had until the file is on screen.
+     * The second view paints nothing until it has tiles, so nothing the reader can see changes before
+     * the swap.
+     *
+     * Only a page already drawn by a still view can be promoted; anything else has nothing prepared to
+     * bring up. A page that cannot be read from the file again keeps what it was showing.
+     */
+    fun promoteToFullDetail(source: BufferedSource, config: Config) {
+        if (pageView !is SubsamplingScaleImageView) return
+        // A page that already has a detail view loading has one. A second would leave the first out of
+        // every field, so it would never be swapped in, never be removed from the tree and never be
+        // recycled — a whole tile pyramid held for nothing.
+        if (detailView != null) return
+
+        val detail = newSubsamplingImageView()
+        detailView = detail
+        detail.applyImageConfig(config)
+        detail.setOnImageEventListener(
+            object : SubsamplingScaleImageView.DefaultOnImageEventListener() {
+                override fun onReady() {
+                    val loaded = detailView ?: return
+                    val preview = pageView as? SubsamplingScaleImageView ?: return
+                    // The swap happened: the file is on screen and what was is taken away in the same
+                    // moment. No page id — the image view does not know the page — so this line is read
+                    // against the holder's `act=promote` for the same page by what surrounds it, and the
+                    // holder logs `act=shown` for the page right after it.
+                    metrics("swap", null, "")
+                    loaded.setupZoom(config)
+                    loaded.isVisible = true
+                    // The prepared view is taken out of the tree but kept, not recycled: it is what
+                    // this page goes back to when the reader moves on, and its pixels are the cache's
+                    // anyway. `previewView` being set is what says the page is on the file's detail.
+                    removeView(preview)
+                    previewView = preview
+                    pageView = loaded
+                    detailView = null
+                    this@ReaderPageImageView.onImageLoaded()
+                }
+
+                override fun onImageLoadError(e: Exception) {
+                    // The file could not be read again. Without this line the promotion is silent: the
+                    // preview stays up and nothing says a swap was tried and failed, which is how a page
+                    // that never gets its detail looks the same as one that was never promoted.
+                    metrics("swapfail", null, "err=${e::class.simpleName} msg=${e.message}")
+                    // A page that cannot be read from the file again keeps what it was showing
+                    detailView?.let {
+                        removeView(it)
+                        it.recycle()
+                    }
+                    detailView = null
+                }
+            },
+        )
+        addView(detail, MATCH_PARENT, MATCH_PARENT)
+        // The view is left drawable rather than hidden: the library reads the file when it is first
+        // drawn, and a view that is never drawn is never read, so an invisible one would sit out its
+        // whole load and answer neither listener. It paints nothing until it has tiles, which is what
+        // keeps the preview on screen for the length of the load and makes the swap at `onReady` the
+        // first thing the reader sees change.
+        // The source is read through `peek()`, which leaves the one the holder kept whole: a page that
+        // is put back to its prepared pixels is promoted again the next time the reader stops on it,
+        // and a source the first promotion consumed would answer the second with nothing at all.
+        detail.setImage(ImageSource.inputStream(source.peek().inputStream()))
+    }
+
+    /**
+     * Puts a page back to what it was prepared at, for the reader has moved on from it.
+     *
+     * The mirror of [promoteToFullDetail], and the thing that keeps the reader's position affordable:
+     * the tiles over the file are the expensive part here — for the measured page, a pyramid over a
+     * 7000×5000 PNG — and only the page the reader stopped on wants that detail. The prepared view is
+     * put back rather than rebuilt, so this is a swap and no decoding.
+     *
+     * Answers whether anything was put back, so a holder that was never promoted says nothing.
+     */
+    fun demoteToCached(): Boolean {
+        val preview = previewView ?: return false
+        val detail = pageView ?: return false
+
+        removeView(detail)
+        (detail as? SubsamplingScaleImageView)?.recycle()
+        addView(preview, MATCH_PARENT, MATCH_PARENT)
+        preview.isVisible = true
+        pageView = preview
+        previewView = null
+        return true
+    }
+
+    /**
+     * Lets go of a page's detail that is still loading, for the reader has moved on from the page it
+     * was for.
+     *
+     * A promotion that has not swapped yet has no prepared view kept aside — the preview is still the
+     * page — so there is nothing to swap back and the only thing to do is stop the load. Removing the
+     * view from the tree is what stops it: the library reads a file when it is first drawn, so a view
+     * that is not drawn has no decode left in it. This is what keeps a fast scroll from queueing a
+     * full decode per page, which is what runs the app out of heap.
+     *
+     * Answers whether there was one to let go of.
+     */
+    fun cancelPromotion(): Boolean {
+        val detail = detailView ?: return false
+        removeView(detail)
+        detail.recycle()
+        detailView = null
+        return true
     }
 
     private fun prepareStripImageView() {

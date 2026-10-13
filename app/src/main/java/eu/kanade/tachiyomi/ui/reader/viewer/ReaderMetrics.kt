@@ -37,12 +37,29 @@ fun metricsTime(): Long = SystemClock.uptimeMillis()
 fun metricsSince(since: Long): Long = metricsTime() - since
 
 /**
- * What identifies a page in a log line. The chapter id and index, not the page object, because a
- * chapter that is looked at again after being released gets brand new page objects for the same
- * pages.
+ * What identifies a page in a log line: the chapter's own number and the page's number within it,
+ * which is what a reader would say out loud ("chapter 1024, page 7") and what the rest of the reader
+ * logs by. The chapter's database id is only a fallback — a source that never numbered a chapter
+ * leaves it at -1, and the id is then the only thing that still identifies it, so it is written with
+ * a `#` to say the line is not readable. The numbers, not the page object, because a chapter that is
+ * looked at again after being released gets brand new page objects for the same pages.
  */
 fun metricsPage(page: ReaderPage): String {
-    return "${page.chapter.chapter.id}/${page.index}"
+    val chapter = page.chapter.chapter
+    val where =
+        if (chapter.isRecognizedNumber) {
+            // Chapter numbers are a double on the domain model, and a whole one is what a reader
+            // would write, so the trailing `.0` is left out
+            val number = chapter.chapterNumber
+            if (number % 1.0 == 0.0) {
+                "${number.toLong()}"
+            } else {
+                "$number"
+            }
+        } else {
+            "#${chapter.id}"
+        }
+    return "$where/${page.number}"
 }
 
 /**

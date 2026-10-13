@@ -22,6 +22,7 @@ import eu.kanade.tachiyomi.ui.reader.viewer.ViewerNavigation.NavigationRegion
 import eu.kanade.tachiyomi.ui.reader.viewer.metrics
 import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
 import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import mihon.app.di.appGraph
@@ -62,6 +63,34 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
      * Touched from the UI thread only.
      */
     val bitmapCache = PageBitmapCache()
+
+    /**
+     * Pages away from the one being read are decoded here, five at a time. A page that is only being
+     * given lead time must not stand in the way of the one being read, and left unbounded the whole
+     * window would be inflating at once, each page at its full size — this is the bitmap path's
+     * counterpart to the strip decoder's single-permit semaphore. Five at a time is where a batch of
+     * pages clears faster than it empties the window; what it pays is the peak, since each of the five
+     * holds the file's own pixels while it inflates them. Anything past the five queues.
+     */
+    val decodeDispatcher = Dispatchers.Default.limitedParallelism(5)
+
+    /**
+     * The same work, one at a time, for a page whose file is big enough that its pixels at the file's
+     * own resolution are a few hundred MB. The limit above is about how much work runs at once; what
+     * bounds this case is memory, and the two are not the same number. The measured page was a 13MB
+     * file over a 140MB frame, and the app's heap is 512MB, so five of those frames decoding together
+     * is already past it — that is an allocation the collector cannot make, not a slow turn. One at a
+     * time keeps a page like this decodable at all.
+     */
+    val bigDecodeDispatcher = Dispatchers.Default.limitedParallelism(2)
+
+    /**
+     * The screen a page is asked to fill, which is what pixels prepared ahead are sized to. The
+     * device's screen rather than the reader's window, because a page is panned and zoomed to parts
+     * of it that are not showing.
+     */
+    val screenWidth get() = activity.resources.displayMetrics.widthPixels
+    val screenHeight get() = activity.resources.displayMetrics.heightPixels
 
     /**
      * Currently active item. It can be a chapter page or a chapter transition.
@@ -113,10 +142,11 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         pager.isVisible = false // Don't layout the pager yet
         pager.layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         pager.isFocusable = false
-        // Two pages of lead either way, so a page that is only being prepared has a whole turn of
-        // lead before it is asked for. One was not enough for a large image: the work outlasted the
-        // time the reader gave it.
-        pager.offscreenPageLimit = 2
+        // Five pages of lead either way. A page that is only being prepared has several turns of
+        // lead before it is asked for, which is what lets a large image be decoded and scaled down
+        // ahead of the turn instead of during it. The pages held this many turns out are the same
+        // pages the pixel cache is sized for, so the window and that budget are one constraint.
+        pager.offscreenPageLimit = 5
         pager.id = R.id.reader_pager
         pager.adapter = adapter
         pager.addOnPageChangeListener(pagerListener)
@@ -165,6 +195,8 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         super.destroy()
         // The pixels are the reader's memory to give back
         bitmapCache.clear()
+        // Which cancels any decode that was still running, so it is not left holding a page's
+        // pixels after the reader is gone
         scope.cancel()
     }
 
@@ -179,6 +211,12 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
     override fun getView(): View {
         return pager
     }
+
+    /**
+     * Whether the given page is the one the reader is on. A holder asks, so the page being read can
+     * take the path that shows it as it is asked for, rather than the one that prepares it ahead.
+     */
+    fun isCurrent(page: ReaderPage): Boolean = currentPage === page
 
     /**
      * Returns the PagerPageHolder for the provided page
@@ -255,9 +293,25 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         // Whether the user would have seen an empty page when this one became current. How long that
         // window lasts is read off the log's own timestamps, against the `act=shown` line the holder
         // writes when the pixels arrive.
+        // The pages the reader left go back to what they were prepared at. The tiles over a page's
+        // file are the expensive thing a holder keeps — for the measured page, a pyramid over a
+        // 7000×5000 PNG, many times the prepared bitmap — and only the page the reader stopped on
+        // wants that detail, so a window of pages that were all looked at closely is what runs the
+        // app out of heap. The page just made current is left out; it takes the promotion below.
+        pager.children
+            .filterIsInstance(PagerPageHolder::class.java)
+            .filter { it.item != page }
+            .forEach { holder ->
+                holder.demoteToPrepared()
+            }
+
         getPageHolder(page)?.let { holder ->
             metrics(if (holder.isImageShown) "ready" else "black", page, "")
             holder.onPageSelected(forward)
+            // The page the reader stopped on is the one that can spend its lead time on detail
+            // rather than on being ready, so a page that was prepared ahead is given the file it
+            // came from here. It is the holder that knows whether it was prepared at all.
+            holder.promoteToFullDetail()
         }
 
         // The reader has moved, so pixels kept for pages far away can be let go

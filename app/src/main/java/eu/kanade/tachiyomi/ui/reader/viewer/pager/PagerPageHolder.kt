@@ -11,6 +11,7 @@ import eu.kanade.tachiyomi.databinding.ReaderErrorBinding
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
+import eu.kanade.tachiyomi.ui.reader.viewer.BIG_DECODE_BYTES
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
 import eu.kanade.tachiyomi.ui.reader.viewer.decodeToBitmap
@@ -74,6 +75,40 @@ class PagerPageHolder(
     private var backgroundJob: Job? = null
 
     /**
+     * The page's file, kept only while the page is on screen from prepared pixels. It is what
+     * [promoteToFullDetail] hands to the view when the reader stops on the page, and it is let go only
+     * when the view is detached: a page that is put back to its prepared pixels when the reader moves
+     * on is brought up to the file again the next time they stop on it, and this is the only copy of
+     * it the holder has. At most the pages on screen hold one.
+     */
+    private var preparedSource: BufferedSource? = null
+
+    /**
+     * Whether this page is on screen from pixels that came back from the cache rather than from a file
+     * this holder has. Such a page wants the file exactly the way a prepared one does — it is on screen
+     * from pixels sized for the screen, and the reader wants the file's own detail once they stop on
+     * it — but the cache hit is what skipped reading the file, so it is not here. This is what says the
+     * promotion has to read it back at that moment, rather than reach for a source this holder never
+     * had. A page that was pushed off screen and is looked at again is always one of these: its holder
+     * was detached, which is where the file it was prepared from is let go.
+     */
+    private var fromCache = false
+
+    /**
+     * Job for reading back the file of a page whose pixels came from the cache, kept as a job so it can
+     * be let go when the reader moves on before the file is here — the same cancellation a queued
+     * promotion gets.
+     */
+    private var promotionJob: Job? = null
+
+    /**
+     * Whether that job was stopped on purpose, because the reader moved on. A stopped read and a file
+     * that cannot be read look the same to the coroutine that was doing one, and only the second is
+     * worth saying something about.
+     */
+    private var promotionCancelled = false
+
+    /**
      * When this holder was made, measured against when the image is drawn. A fresh one for a page
      * that was already on screen is a re-decode, which is what the log is for.
      */
@@ -99,6 +134,14 @@ class PagerPageHolder(
         // Otherwise a page that was only looked at for a moment keeps a full bitmap alive
         backgroundJob?.cancel()
         backgroundJob = null
+        // And the file it was prepared from, which is the larger of the two
+        preparedSource = null
+        // Including one that was still being read back for a page that is off screen now
+        promotionJob?.let { job ->
+            promotionCancelled = true
+            job.cancel()
+        }
+        promotionJob = null
     }
 
     private fun initProgressIndicator() {
@@ -169,19 +212,26 @@ class PagerPageHolder(
     /**
      * Called when the page is ready.
      */
+    /**
+     * How the view is set up for a page. Read twice for a page that is prepared and then shown: the
+     * prepared pixels and the file that replaces them are the same page in the same view, and a
+     * second reading of the settings is cheaper than carrying the first one's `Config` along.
+     */
+    private fun imageConfig(): Config = Config(
+        zoomDuration = viewer.config.doubleTapAnimDuration,
+        minimumScaleType = viewer.config.imageScaleType,
+        cropBorders = viewer.config.imageCropBorders,
+        zoomStartPosition = viewer.config.imageZoomType,
+        landscapeZoom = viewer.config.landscapeZoom,
+    )
+
     private suspend fun setImage() {
         progressIndicator?.setProgress(0)
 
         val streamFn = page.stream ?: return
 
         try {
-            val config = Config(
-                zoomDuration = viewer.config.doubleTapAnimDuration,
-                minimumScaleType = viewer.config.imageScaleType,
-                cropBorders = viewer.config.imageCropBorders,
-                zoomStartPosition = viewer.config.imageZoomType,
-                landscapeZoom = viewer.config.landscapeZoom,
-            )
+            val config = imageConfig()
 
             // Pixels for this page may already be decoded, by this holder or by an earlier one for a
             // page that was pushed off screen and is being looked at again. A half of a spread is
@@ -194,6 +244,10 @@ class PagerPageHolder(
                     withContext(Dispatchers.Main) { viewer.bitmapCache.find(page) }
                 }
             if (cached != null) {
+                // The page is on screen from pixels that were made elsewhere, so it has no file of its
+                // own to bring up to detail when the reader stops on it. That is what [fromCache] says,
+                // and what makes the promotion read the file back at that moment.
+                fromCache = true
                 metrics("hit", page, "bytes=${cached.allocationByteCount}")
                 withContext(Dispatchers.Main) {
                     setImage(cached, config)
@@ -229,14 +283,35 @@ class PagerPageHolder(
             // all the user would ever see of a moving page, and the pixels kept for it are the same
             // first frame the animated view would throw away. Animated pages keep the file path,
             // where the animated view is the one holding the frames.
+            // Only for a page away from the reading position. A page the reader is on is being asked
+            // for now, so it has no lead time to spend and nothing to prepare ahead of the turn; it
+            // takes the file path below, where the view tiles it as it lays out and keeps the file's
+            // own detail under zoom. A page that is only being given lead time has several turns
+            // before it is asked for, and is shown as soon as it is — and when the reader does stop
+            // on one, [promoteToFullDetail] hands the view the file instead, so this rule only ever
+            // holds for a page the reader jumped to without a holder ahead of the turn.
+            val isLeadPage = !viewer.isCurrent(page)
             val decodedAt = metricsTime()
             val bitmap =
-                if (isAnimated) {
+                if (isAnimated || !isLeadPage) {
                     null
                 } else {
-                    withContext(Dispatchers.Default) {
+                    // The window's bound is on how much work runs at once, and memory is a different
+                    // bound. A page whose file is over [BIG_DECODE_BYTES] inflates to a frame of a few
+                    // hundred MB, and the app's heap is 512MB, so five of those at once is an
+                    // allocation that cannot be made at all rather than a slow turn. The file's size is
+                    // a proxy for the frame, not the frame: only the decoder knows the real size, and by
+                    // then the frame is already allocated, so this decides how many such pages are
+                    // decoded at a time, never whether one is.
+                    val lane =
+                        if (bytes > BIG_DECODE_BYTES) {
+                            viewer.bigDecodeDispatcher
+                        } else {
+                            viewer.decodeDispatcher
+                        }
+                    withContext(lane) {
                         try {
-                            decodeToBitmap(source)
+                            decodeToBitmap(source, viewer.screenWidth, viewer.screenHeight)
                         } catch (e: Throwable) {
                             logcat(LogPriority.ERROR, e)
                             null
@@ -245,23 +320,51 @@ class PagerPageHolder(
                 }
             val decoded = metricsSince(decodedAt)
 
+            var kept = false
             withContext(Dispatchers.Main) {
                 if (bitmap != null) {
                     setImage(bitmap, config)
+                    // The page is on screen from pixels sized for it, so the file is kept for the
+                    // time it becomes the page being read (see [promoteToFullDetail])
+                    preparedSource = source
                     if (!isSpreadHalf) {
-                        viewer.bitmapCache.store(page, bitmap)
+                        kept = viewer.bitmapCache.store(page, bitmap)
                     }
+                    // The rule above is read before the decode, not after it, so a page that became
+                    // the one the reader is on while its pixels were still being prepared has no
+                    // promotion coming to it from the turn — that moment has already passed. The
+                    // promotion is asked for here as well, and it answers for itself when this is not
+                    // the page being read.
+                    promoteToFullDetail()
                 } else {
                     setImage(source, isAnimated, config)
                 }
                 removeErrorLayout()
             }
 
+            // The pixels the page ended up with, where they were made here rather than drawn from the
+            // file: the bitmap is already in hand, so its size and its cost are free to say. `bytes=`
+            // above is the file, `pixels=` is what is held in memory, and `kept=` is whether it is
+            // in the cache for the next time this page is asked for.
+            val pixels =
+                if (bitmap == null) {
+                    ""
+                } else {
+                    " dim=${bitmap.width}x${bitmap.height} pixels=${bitmap.allocationByteCount}"
+                }
+            // A half of a spread is neither looked up nor kept, so it has nothing to answer here
+            val keptField =
+                if (bitmap == null || isSpreadHalf) {
+                    ""
+                } else {
+                    " kept=$kept"
+                }
+
             // Up to the page being accepted, not to every tile of it being drawn
             metrics(
                 "page",
                 item,
-                "read=$read process=$processed decode=$decoded total=${metricsSince(started)} bytes=$bytes",
+                "read=$read process=$processed decode=$decoded total=${metricsSince(started)} bytes=$bytes$pixels$keptField",
             )
 
             // Only when the setting asks for it. A fixed theme colour is painted by the reader behind
@@ -276,6 +379,108 @@ class PagerPageHolder(
             withContext(Dispatchers.Main) {
                 setError(e)
             }
+        }
+    }
+
+    /**
+     * Called when this page becomes the one the reader is on, and it was on screen from prepared
+     * pixels. Those pixels are all a prepared page will ever show: they are sized to the screen, so
+     * zooming into them shows the pixels rather than more detail. Once the reader stops on the page
+     * there is no more lead time to spend, so the file is handed to the view instead — the
+     * subsampling view tiles it as it lays out and keeps the file's own detail at every zoom. The
+     * swap is what the reader pays at the stop, not at the turn, and it is why a page that was only
+     * passed through keeps its prepared pixels.
+     *
+     * Nothing is swapped when the reader has already moved on, or when this page was never prepared.
+     * A page whose pixels came back from the cache is prepared in exactly the same way and wants the
+     * same thing; it is only that its file was never read, which is what the cache hit skipped, so for
+     * that one the file is read back here first. The prepared pixels stay in the cache either way:
+     * scrolling back over this page is answered by them again, and it promotes again.
+     */
+    fun promoteToFullDetail() {
+        // Read first, so the method is safe to call at either time a page can become the one being
+        // read: a page that is not current keeps its file and is promoted when the reader reaches it.
+        if (!viewer.isCurrent(page)) {
+            return
+        }
+        val source = preparedSource
+        if (source != null) {
+            startPromotion(source)
+            return
+        }
+        // No file in hand. Only a page that is on screen from cached pixels still wants one — a page
+        // that took the file path is showing the file already, and a page that was prepared has one
+        // above. The read is a job rather than this call, because the turn is on the UI thread and a
+        // page's file is tens of MB to read and split.
+        if (!fromCache || promotionJob != null) {
+            return
+        }
+        val streamFn = page.stream ?: return
+        promotionCancelled = false
+        promotionJob = scope.launch {
+            try {
+                // The same two hops the miss path runs, so a page that was split or rotated to fit is
+                // brought up to the half of it it is showing, not to the whole spread
+                val buffer = withContext(Dispatchers.IO) { streamFn().use { Buffer().readFrom(it) } }
+                val file = withContext(Dispatchers.Default) { process(item, buffer) }
+                withContext(Dispatchers.Main) {
+                    promotionJob = null
+                    // Held for as long as the page is on screen, like a prepared page's is: the file is
+                    // here for the next time the reader stops on it, and let go when the view is detached
+                    preparedSource = file
+                    // The reader may have moved on while the file was being read, and a page they left
+                    // keeps its prepared pixels
+                    if (viewer.isCurrent(page)) {
+                        startPromotion(file)
+                    }
+                }
+            } catch (e: Throwable) {
+                promotionJob = null
+                // A read that was stopped because the reader moved on is not a failure; one that could
+                // not be read at all is, and is the only reason a page keeps its prepared pixels
+                if (!promotionCancelled) {
+                    logcat(LogPriority.ERROR, e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Hands the view the file and says so. Split out because the file arrives at two moments: the one
+     * a prepared page already has, and the one a page whose pixels came back from the cache has to
+     * read back first.
+     */
+    private fun startPromotion(source: BufferedSource) {
+        val from = viewer.bitmapCache.find(page)?.let { "from=${it.width}x${it.height}" } ?: ""
+        promoteToFullDetail(source, imageConfig())
+        metrics("promote", page, from)
+    }
+
+    /**
+     * Called when this page stops being the one the reader is on, and it was brought up to the file's
+     * own detail. The tiles over the file are the expensive thing a page holds here — for the measured
+     * page, a pyramid over a 7000×5000 PNG, many times the prepared bitmap — and the reader only wants
+     * that detail on the page they stopped on, so a page they have left goes back to the prepared
+     * pixels. It is a swap of two views the holder already has, so it costs no decoding, and the page
+     * can be brought up to the file again when the reader comes back to it.
+     *
+     * Nothing happens for a page that was never promoted. A page whose promotion is still loading has
+     * nothing to swap back — the prepared view is still the page — so for that one the load is let go
+     * instead, which is what keeps a fast scroll from queueing a full decode per page. A page whose
+     * file is still being read back for it is let go the same way, before the read is spent.
+     */
+    fun demoteToPrepared() {
+        // A file the reader is no longer asking for is not worth reading, and this is the moment they
+        // stopped asking
+        promotionJob?.let { job ->
+            promotionCancelled = true
+            job.cancel()
+        }
+        promotionJob = null
+        if (demoteToCached()) {
+            metrics("demote", page, "")
+        } else if (cancelPromotion()) {
+            metrics("cancel", page, "")
         }
     }
 

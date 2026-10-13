@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.ui.reader.viewer
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.drawable.Animatable
@@ -75,6 +76,12 @@ open class ReaderPageImageView @JvmOverloads constructor(
     var pageBackground: Drawable? = null
 
     /**
+     * Whether an image is drawn here. The viewers ask it when an item becomes the current one, to
+     * know whether the user would have seen an empty page.
+     */
+    var isImageShown = false
+
+    /**
      * Whether a touch on the given on down event landed where the reader wants a tap, in which
      * case a double tap must not zoom the image. Set by the page holder, the only one that knows
      * where its tap zones are.
@@ -89,6 +96,16 @@ open class ReaderPageImageView @JvmOverloads constructor(
     @CallSuper
     open fun onImageLoaded() {
         onImageLoaded?.invoke()
+        isImageShown = true
+        applyPageBackground()
+    }
+
+    /**
+     * Paints the page background behind the image. [onImageLoaded] does it for the common case,
+     * where the background is already known by the time the image is drawn; a holder that worked it
+     * out afterwards calls this once it is, so the margins repaint after the page appeared.
+     */
+    fun applyPageBackground() {
         background = pageBackground
     }
 
@@ -166,6 +183,19 @@ open class ReaderPageImageView @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Shows pixels that were decoded already. The image is handed the pixels rather than the file, so
+     * nothing is decoded a second time to draw it; what is given up is the library's own decoding,
+     * which can draw a page in pieces and at more detail than the pixels hold once zoomed into.
+     *
+     * Only for a page that is not animated, which is the only kind the reader keeps pixels for.
+     */
+    fun setImage(bitmap: Bitmap, config: Config) {
+        this.config = config
+        prepareNonAnimatedImageView()
+        setNonAnimatedImage(bitmap, config)
+    }
+
     fun setImage(source: BufferedSource, isAnimated: Boolean, config: Config) {
         this.config = config
         if (isAnimated) {
@@ -181,6 +211,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
     }
 
     fun recycle() {
+        isImageShown = false
         stripRequest?.dispose()
         stripRequest = null
         pageView?.let {
@@ -335,6 +366,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
         )
 
         when (data) {
+            is Bitmap -> {
+                setImage(ImageSource.bitmap(data))
+                isVisible = true
+            }
             is BitmapDrawable -> {
                 setImage(ImageSource.bitmap(data.bitmap))
                 isVisible = true

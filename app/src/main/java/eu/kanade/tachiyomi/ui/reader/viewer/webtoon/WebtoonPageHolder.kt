@@ -15,6 +15,9 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
+import eu.kanade.tachiyomi.ui.reader.viewer.metrics
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
 import eu.kanade.tachiyomi.util.system.dpToPx
 import kotlinx.coroutines.Dispatchers
@@ -78,6 +81,13 @@ class WebtoonPageHolder(
      */
     private var loadJob: Job? = null
 
+    /**
+     * When the current page was bound to this view, measured against when its pixels arrive. A view
+     * that was already showing this page and gets bound again is a re-decode, which is what the log
+     * is for.
+     */
+    private var boundAt = 0L
+
     init {
         refreshLayoutParams()
 
@@ -91,6 +101,8 @@ class WebtoonPageHolder(
      */
     fun bind(page: ReaderPage) {
         this.page = page
+        metrics("bind", page, "")
+        boundAt = metricsTime()
         loadJob?.cancel()
         loadJob = scope.launch { loadPageAndProcessStatus() }
         refreshLayoutParams()
@@ -111,6 +123,8 @@ class WebtoonPageHolder(
      * Called when the view is recycled and added to the view pool.
      */
     override fun recycle() {
+        // The page this view was showing is dropped from the pool, so the next one re-reads it
+        page?.let { metrics("recycle", it, "") }
         loadJob?.cancel()
         loadJob = null
 
@@ -187,13 +201,20 @@ class WebtoonPageHolder(
         val streamFn = page?.stream ?: return
 
         try {
+            val started = metricsTime()
             val buffer = withContext(Dispatchers.IO) { streamFn().use { Buffer().readFrom(it) } }
+            val bytes = buffer.size
+            val read = metricsSince(started)
+
             // Splitting and merging decode the image, which is CPU work
+            val processedAt = metricsTime()
             val (source, isAnimated) = withContext(Dispatchers.Default) {
                 val source = process(buffer)
                 val isAnimated = ImageUtil.isAnimatedAndSupported(source)
                 Pair(source, isAnimated)
             }
+            val processed = metricsSince(processedAt)
+
             withContext(Dispatchers.Main) {
                 frame.setImage(
                     source,
@@ -206,6 +227,10 @@ class WebtoonPageHolder(
                 )
                 removeErrorLayout()
             }
+
+            // Up to the page being accepted. The strips are decoded after this, and the `act=shown`
+            // line carries the whole of it.
+            metrics("page", page, "read=$read process=$processed total=${metricsSince(started)} bytes=$bytes")
         } catch (e: Throwable) {
             logcat(LogPriority.ERROR, e)
             withContext(Dispatchers.Main) {
@@ -252,6 +277,8 @@ class WebtoonPageHolder(
      * Called when the image is decoded and going to be displayed.
      */
     private fun onImageDecoded() {
+        // Pixels up, measured from the bind that asked for this page
+        page?.let { metrics("shown", it, "total=${metricsSince(boundAt)}") }
         progressContainer.isVisible = false
         removeErrorLayout()
     }

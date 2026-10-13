@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.ui.reader.viewer.pager
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.drawable.ColorDrawable
 import android.view.LayoutInflater
 import androidx.core.view.isVisible
 import eu.kanade.presentation.util.formattedMessage
@@ -11,6 +13,10 @@ import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderPageImageView
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
+import eu.kanade.tachiyomi.ui.reader.viewer.decodeToBitmap
+import eu.kanade.tachiyomi.ui.reader.viewer.metrics
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
 import eu.kanade.tachiyomi.widget.ViewPagerAdapter
 import kotlinx.coroutines.Dispatchers
@@ -61,7 +67,20 @@ class PagerPageHolder(
      */
     private var loadJob: Job? = null
 
+    /**
+     * Job for the colour of the margins, kept apart from [loadJob] so it cannot stand in the way
+     * of the first pixels.
+     */
+    private var backgroundJob: Job? = null
+
+    /**
+     * When this holder was made, measured against when the image is drawn. A fresh one for a page
+     * that was already on screen is a re-decode, which is what the log is for.
+     */
+    private val createdAt = metricsTime()
+
     init {
+        metrics("holder", page, "")
         loadJob = scope.launch { loadPageAndProcessStatus() }
         // A double tap on a tap zone turns pages, so it must not be spent on zooming the image
         isDoubleTapZoomSuppressed = { event ->
@@ -77,6 +96,9 @@ class PagerPageHolder(
         super.onDetachedFromWindow()
         loadJob?.cancel()
         loadJob = null
+        // Otherwise a page that was only looked at for a moment keeps a full bitmap alive
+        backgroundJob?.cancel()
+        backgroundJob = null
     }
 
     private fun initProgressIndicator() {
@@ -153,34 +175,101 @@ class PagerPageHolder(
         val streamFn = page.stream ?: return
 
         try {
+            val config = Config(
+                zoomDuration = viewer.config.doubleTapAnimDuration,
+                minimumScaleType = viewer.config.imageScaleType,
+                cropBorders = viewer.config.imageCropBorders,
+                zoomStartPosition = viewer.config.imageZoomType,
+                landscapeZoom = viewer.config.landscapeZoom,
+            )
+
+            // Pixels for this page may already be decoded, by this holder or by an earlier one for a
+            // page that was pushed off screen and is being looked at again. A half of a spread is
+            // left out: it stands where the page it was made from stands, and shows the other half.
+            val isSpreadHalf = page is InsertPage
+            val cached =
+                if (isSpreadHalf) {
+                    null
+                } else {
+                    withContext(Dispatchers.Main) { viewer.bitmapCache.find(page) }
+                }
+            if (cached != null) {
+                metrics("hit", page, "bytes=${cached.allocationByteCount}")
+                withContext(Dispatchers.Main) {
+                    setImage(cached, config)
+                    removeErrorLayout()
+                }
+                // Same rule as the path below: with a fixed theme there is nothing to sample, and
+                // a colour set here would be painted over the reader's. Pixels are kept only for
+                // pages that are not animated, so there is no animated case to skip here.
+                if (viewer.config.automaticBackground) {
+                    showBackgroundFor(cached, null)
+                }
+                return
+            }
+
+            val started = metricsTime()
             val buffer = withContext(Dispatchers.IO) { streamFn().use { Buffer().readFrom(it) } }
-            // Splitting, merging and sampling the background decode the image, which is CPU work
-            val (source, isAnimated, background) = withContext(Dispatchers.Default) {
+            val bytes = buffer.size
+            val read = metricsSince(started)
+
+            // Splitting and merging the image are CPU work over the bytes that were just read
+            val processedAt = metricsTime()
+            val (source, isAnimated) = withContext(Dispatchers.Default) {
                 val source = process(item, buffer)
                 val isAnimated = ImageUtil.isAnimatedAndSupported(source)
-                val background = if (!isAnimated && viewer.config.automaticBackground) {
-                    ImageUtil.chooseBackground(context, source.peek().inputStream())
-                } else {
-                    null
-                }
-                Triple(source, isAnimated, background)
+                Pair(source, isAnimated)
             }
+            val processed = metricsSince(processedAt)
+
+            // The image is decoded here rather than by the view at layout time, which keeps the whole
+            // of it off the main thread and, for a page that is only being given lead time, off the
+            // turn. A page that cannot be decoded this way keeps the older path.
+            // Only for a page that is not animated. A still decode takes the first frame, which is
+            // all the user would ever see of a moving page, and the pixels kept for it are the same
+            // first frame the animated view would throw away. Animated pages keep the file path,
+            // where the animated view is the one holding the frames.
+            val decodedAt = metricsTime()
+            val bitmap =
+                if (isAnimated) {
+                    null
+                } else {
+                    withContext(Dispatchers.Default) {
+                        try {
+                            decodeToBitmap(source)
+                        } catch (e: Throwable) {
+                            logcat(LogPriority.ERROR, e)
+                            null
+                        }
+                    }
+                }
+            val decoded = metricsSince(decodedAt)
+
             withContext(Dispatchers.Main) {
-                setImage(
-                    source,
-                    isAnimated,
-                    Config(
-                        zoomDuration = viewer.config.doubleTapAnimDuration,
-                        minimumScaleType = viewer.config.imageScaleType,
-                        cropBorders = viewer.config.imageCropBorders,
-                        zoomStartPosition = viewer.config.imageZoomType,
-                        landscapeZoom = viewer.config.landscapeZoom,
-                    ),
-                )
-                if (!isAnimated) {
-                    pageBackground = background
+                if (bitmap != null) {
+                    setImage(bitmap, config)
+                    if (!isSpreadHalf) {
+                        viewer.bitmapCache.store(page, bitmap)
+                    }
+                } else {
+                    setImage(source, isAnimated, config)
                 }
                 removeErrorLayout()
+            }
+
+            // Up to the page being accepted, not to every tile of it being drawn
+            metrics(
+                "page",
+                item,
+                "read=$read process=$processed decode=$decoded total=${metricsSince(started)} bytes=$bytes",
+            )
+
+            // Only when the setting asks for it. A fixed theme colour is painted by the reader behind
+            // the pages, and a sampled colour here would cover it and the setting would do nothing.
+            if (!isAnimated && viewer.config.automaticBackground) {
+                // Pixels already decoded are sampled directly; only a page that had to fall back to
+                // the view's own decoding is sampled from the file again.
+                showBackgroundFor(bitmap, if (bitmap != null) null else source.peek())
             }
         } catch (e: Throwable) {
             logcat(LogPriority.ERROR, e)
@@ -188,6 +277,56 @@ class PagerPageHolder(
                 setError(e)
             }
         }
+    }
+
+    /**
+     * Works out the colour of the margins, kept apart from the page so it cannot stand in front of
+     * the first pixels. Pixels that are already decoded are sampled by reading nine of them; a page
+     * that had to fall back to the view's own decoding is sampled from the file, as it was before.
+     *
+     * Only called when the setting asks for sampled margins. A fixed theme colour belongs to the
+     * reader behind the pages, and a background set here is drawn over it.
+     */
+    private fun showBackgroundFor(bitmap: Bitmap?, backgroundSource: BufferedSource?) {
+        if (bitmap == null && backgroundSource == null) {
+            return
+        }
+        backgroundJob = scope.launch {
+            try {
+                val drawable = withContext(Dispatchers.Default) {
+                    if (bitmap != null) {
+                        ImageUtil.chooseBackground(context, bitmap)
+                    } else if (backgroundSource != null) {
+                        ImageUtil.chooseBackground(context, backgroundSource.inputStream())
+                    } else {
+                        error("Nothing to sample the margins from")
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    pageBackground = drawable
+                    applyPageBackground()
+                    logPageBackground()
+                }
+            } catch (e: Throwable) {
+                // A missing margin colour is not a missing page
+                logcat(LogPriority.ERROR, e)
+            }
+        }
+    }
+
+    /**
+     * Says what colour the page area ended up with, so the letterbox can be read off the log.
+     * `color=none` is a holder that paints nothing of its own, which is what a fixed theme should
+     * look like: the reader's colour behind it is what the user sees. Two lines for one page, the
+     * second one carrying a colour, is the margins repainting after the page appeared.
+     */
+    private fun logPageBackground() {
+        val painted = pageBackground
+        val color = when (painted) {
+            is ColorDrawable -> painted.color.toString(16)
+            else -> "none"
+        }
+        metrics("bg", page, "color=$color")
     }
 
     private fun process(page: ReaderPage, imageSource: BufferedSource): BufferedSource {
@@ -257,6 +396,8 @@ class PagerPageHolder(
 
     override fun onImageLoaded() {
         super.onImageLoaded()
+        logPageBackground()
+        metrics("shown", item, "total=${metricsSince(createdAt)}")
         progressIndicator?.hide()
     }
 

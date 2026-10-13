@@ -326,7 +326,11 @@ object ImageUtil {
         }
     }
 
-    private fun chooseBackground(context: Context, image: Bitmap): Drawable {
+    /**
+     * Algorithm for determining what background to accompany a comic/manga page, from pixels that are
+     * already decoded. The bitmap is left as it is, for whoever is still drawing it.
+     */
+    fun chooseBackground(context: Context, image: Bitmap): Drawable {
         val whiteColor = Color.WHITE
         if (image.width < 50 || image.height < 50) {
             return whiteColor.toDrawable()

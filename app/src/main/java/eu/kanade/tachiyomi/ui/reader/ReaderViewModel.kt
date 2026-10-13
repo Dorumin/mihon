@@ -48,6 +48,9 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderOrientation
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
 import eu.kanade.tachiyomi.ui.reader.viewer.Viewer
+import eu.kanade.tachiyomi.ui.reader.viewer.metrics
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
 import eu.kanade.tachiyomi.util.chapter.filterDownloaded
 import eu.kanade.tachiyomi.util.chapter.removeDuplicates
 import eu.kanade.tachiyomi.util.editCover
@@ -433,6 +436,7 @@ class ReaderViewModel(
         loader: ChapterLoader,
         chapter: ReaderChapter,
     ): ViewerChapters {
+        val started = metricsTime()
         loader.loadChapter(chapter)
 
         val chapterPos = chapterList.indexOf(chapter)
@@ -445,6 +449,13 @@ class ReaderViewModel(
             prevMissingCount = missingFromSource(chapter, prevChapter),
             nextMissingCount = missingFromSource(nextChapter, chapter),
         )
+        // How long it took to open the chapter, and what there is to show once it did
+        metrics(
+            "chapter",
+            null,
+            "ch=${chapter.chapter.id} load=${metricsSince(started)} pages=${chapter.pages?.size ?: 0}",
+        )
+
         preloadNextChapterAfter(newChapters)
 
         withContext(Dispatchers.Main) {
@@ -514,15 +525,16 @@ class ReaderViewModel(
     private var nextChapterPreloadJob: Job? = null
 
     /**
-     * Preloads the next chapter of [chapters] once the current one has loaded, so it doesn't take bandwidth from the
-     * pages being read. Skipped when loading ahead isn't allowed on this network.
+     * Preloads the next chapter of [chapters] once the current one has loaded, so it doesn't take
+     * bandwidth from the pages being read. Only skipped for chapters that fetch their pages, and
+     * only when loading ahead isn't allowed on this network.
      */
     private fun preloadNextChapterAfter(chapters: ViewerChapters) {
         val nextChapter = chapters.nextChapter ?: return
         nextChapterPreloadJob?.cancel()
         nextChapterPreloadJob = viewModelScope.launch(Dispatchers.IO) {
-            if (!canLoadAhead()) return@launch
             val current = chapters.currChapter
+            if (!canLoadAheadFor(current)) return@launch
             // Only online pages load in the background; other loaders load a page once it's shown
             if (current.pageLoader is HttpPageLoader) {
                 current.pages.orEmpty().forEach { page ->
@@ -538,6 +550,14 @@ class ReaderViewModel(
      */
     private fun canLoadAhead(): Boolean =
         !readerPreferences.loadAheadOnlyOverWifi.get() || context.activeNetworkState().isWifi
+
+    /**
+     * Whether the given [chapter] may load past the pages near the one being read. The network only
+     * matters to chapters that fetch their pages; a local one spends the disk on that, which is
+     * always worth doing ahead of the page being read.
+     */
+    private fun canLoadAheadFor(chapter: ReaderChapter): Boolean =
+        chapter.pageLoader?.isLocal == true || canLoadAhead()
 
     /**
      * Called when the viewers decide it's a good time to preload a [chapter] and improve the UX so

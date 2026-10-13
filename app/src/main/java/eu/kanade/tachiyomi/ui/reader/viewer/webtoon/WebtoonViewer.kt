@@ -17,6 +17,9 @@ import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.model.ViewerChapters
 import eu.kanade.tachiyomi.ui.reader.viewer.Viewer
 import eu.kanade.tachiyomi.ui.reader.viewer.ViewerNavigation.NavigationRegion
+import eu.kanade.tachiyomi.ui.reader.viewer.metrics
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import mihon.app.di.appGraph
@@ -69,6 +72,13 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
      * Currently active item. It can be a chapter page or a chapter transition.
      */
     private var currentPage: Any? = null
+
+    /**
+     * The transition the user is on and when they got to it, to measure how long they sat there.
+     * Read from the log only, nothing in the reader acts on it.
+     */
+    private var transitionSeen: ChapterTransition? = null
+    private var transitionSeenAt = 0L
 
     private val threshold: Int by lazy { readerPreferences.readerHideThreshold.get().threshold }
 
@@ -201,6 +211,17 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
         logcat { "onPageSelected: ${page.number}/${pages.size}" }
         activity.onPageSelected(page)
 
+        // How long the user sat on a chapter transition before this page came up
+        transitionSeen?.let { seen ->
+            val kind = if (seen is ChapterTransition.Next) "next" else "prev"
+            metrics("transition", null, "kind=$kind dwell=${metricsSince(transitionSeenAt)}")
+            transitionSeen = null
+        }
+
+        // The moment this page became the one on screen. The window it was blank for is the gap to
+        // the `act=shown` line the holder writes for the same page.
+        metrics("select", page, "")
+
         // Preload next chapter once we're within the last 5 pages of the current chapter
         val inPreloadRange = pages.size - page.number < 5
         if (inPreloadRange && allowPreload && page.chapter == adapter.currentChapter) {
@@ -230,6 +251,8 @@ class WebtoonViewer(val activity: ReaderActivity, val isContinuous: Boolean = tr
      */
     private fun onTransitionSelected(transition: ChapterTransition) {
         logcat { "onTransitionSelected: $transition" }
+        transitionSeen = transition
+        transitionSeenAt = metricsTime()
         val toChapter = transition.to
         if (toChapter != null) {
             logcat { "Request preload destination chapter because we're on the transition" }

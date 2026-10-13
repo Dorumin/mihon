@@ -16,8 +16,12 @@ import eu.kanade.tachiyomi.ui.reader.model.ChapterTransition
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.model.ViewerChapters
+import eu.kanade.tachiyomi.ui.reader.viewer.PageBitmapCache
 import eu.kanade.tachiyomi.ui.reader.viewer.Viewer
 import eu.kanade.tachiyomi.ui.reader.viewer.ViewerNavigation.NavigationRegion
+import eu.kanade.tachiyomi.ui.reader.viewer.metrics
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import mihon.app.di.appGraph
@@ -53,9 +57,23 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
     private val adapter = PagerViewerAdapter(this)
 
     /**
+     * Pixels for the pages around the one being read, kept here rather than in a page's holder so
+     * that they survive a page being pushed off screen, which is what makes turning back cheap.
+     * Touched from the UI thread only.
+     */
+    val bitmapCache = PageBitmapCache()
+
+    /**
      * Currently active item. It can be a chapter page or a chapter transition.
      */
     private var currentPage: Any? = null
+
+    /**
+     * The transition the user is on and when they got to it, to measure how long they sat there.
+     * Read from the log only, nothing in the reader acts on it.
+     */
+    private var transitionSeen: ChapterTransition? = null
+    private var transitionSeenAt = 0L
 
     /**
      * Viewer chapters to set when the pager enters idle mode. Otherwise, if the view was settling
@@ -95,7 +113,10 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         pager.isVisible = false // Don't layout the pager yet
         pager.layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         pager.isFocusable = false
-        pager.offscreenPageLimit = 1
+        // Two pages of lead either way, so a page that is only being prepared has a whole turn of
+        // lead before it is asked for. One was not enough for a large image: the work outlasted the
+        // time the reader gave it.
+        pager.offscreenPageLimit = 2
         pager.id = R.id.reader_pager
         pager.adapter = adapter
         pager.addOnPageChangeListener(pagerListener)
@@ -129,6 +150,8 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         }
 
         config.imagePropertyChangedListener = {
+            // Pixels kept for how an image was shown are not the pixels for it as it is now shown
+            bitmapCache.clear()
             refreshAdapter()
         }
 
@@ -140,6 +163,8 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
 
     override fun destroy() {
         super.destroy()
+        // The pixels are the reader's memory to give back
+        bitmapCache.clear()
         scope.cancel()
     }
 
@@ -220,8 +245,23 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         logcat { "onReaderPageSelected: ${page.number}/${pages.size}" }
         activity.onPageSelected(page)
 
-        // Notify holder of page change
-        getPageHolder(page)?.onPageSelected(forward)
+        // How long the user sat on a chapter transition before this page came up
+        transitionSeen?.let { seen ->
+            val kind = if (seen is ChapterTransition.Next) "next" else "prev"
+            metrics("transition", null, "kind=$kind dwell=${metricsSince(transitionSeenAt)}")
+            transitionSeen = null
+        }
+
+        // Whether the user would have seen an empty page when this one became current. How long that
+        // window lasts is read off the log's own timestamps, against the `act=shown` line the holder
+        // writes when the pixels arrive.
+        getPageHolder(page)?.let { holder ->
+            metrics(if (holder.isImageShown) "ready" else "black", page, "")
+            holder.onPageSelected(forward)
+        }
+
+        // The reader has moved, so pixels kept for pages far away can be let go
+        bitmapCache.trimTo(adapter.items.filterIsInstance(ReaderPage::class.java), page)
 
         // Skip preload on inserts it causes unwanted page jumping
         if (page is InsertPage) {
@@ -249,6 +289,8 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
      */
     private fun onTransitionSelected(transition: ChapterTransition) {
         logcat { "onTransitionSelected: $transition" }
+        transitionSeen = transition
+        transitionSeenAt = metricsTime()
         val toChapter = transition.to
         if (toChapter != null) {
             logcat { "Request preload destination chapter because we're on the transition" }

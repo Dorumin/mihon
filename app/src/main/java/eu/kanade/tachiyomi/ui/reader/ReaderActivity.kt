@@ -73,6 +73,7 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderSettingsViewModel
 import eu.kanade.tachiyomi.ui.reader.setting.ReadingMode
 import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
+import eu.kanade.tachiyomi.ui.reader.viewer.metrics
 import eu.kanade.tachiyomi.ui.reader.viewer.pager.R2LPagerViewer
 import eu.kanade.tachiyomi.ui.reader.viewer.webgpu.WebGpuViewer
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
@@ -863,7 +864,11 @@ class ReaderActivity : BaseActivity() {
         init {
             readerPreferences.readerTheme.changes()
                 .onEach { theme ->
-                    binding.readerContainer.setBackgroundColor(baseContext.readerBackgroundColor(theme))
+                    val color = baseContext.readerBackgroundColor(theme)
+                    // Whether this line appears at all says if the subscription is alive; the colour
+                    // says whether the setting was read, and the id says which view was painted.
+                    metrics("theme", null, "value=$theme color=${color.toString(16)} view=${binding.readerContainer.id}")
+                    binding.readerContainer.setBackgroundColor(color)
                 }
                 .launchIn(lifecycleScope)
 

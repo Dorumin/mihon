@@ -38,6 +38,7 @@ import com.github.chrisbanes.photoview.PhotoView
 import eu.kanade.tachiyomi.data.coil.ImageDecoder
 import eu.kanade.tachiyomi.data.coil.cropBorders
 import eu.kanade.tachiyomi.data.coil.webtoonStrips
+import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.viewer.webtoon.WebtoonStripImageView
 import eu.kanade.tachiyomi.util.system.animatorDurationScale
 import eu.kanade.tachiyomi.util.view.isVisibleOnScreen
@@ -111,6 +112,23 @@ open class ReaderPageImageView @JvmOverloads constructor(
      * where its tap zones are.
      */
     var isDoubleTapZoomSuppressed: ((MotionEvent) -> Boolean)? = null
+
+    /**
+     * Which page this view was made for, set by the holder for the same reason as
+     * [isDoubleTapZoomSuppressed]: the view is not given one, and a zoom line that carries no page
+     * cannot be read against the holder's lines, because two pages of the same size report the same
+     * fit. Only the zoom log needs it, and only for reading a log back, so it stays here rather than
+     * becoming part of what a view knows.
+     */
+    var zoomPage: ReaderPage? = null
+
+    /**
+     * Which of the two views this one is drawing with, for the zoom log: the page's own prepared
+     * pixels, or the file's own detail swapped in over them. The two have different fits — one is the
+     * viewport, the other the file — and a reader's gesture reaches whichever is on screen, so a line
+     * that does not say which cannot be compared against the other.
+     */
+    private var zoomSubject = "page"
 
     /**
      * Whether zoom is turned off for the touch in progress, to be restored when it ends.
@@ -238,9 +256,12 @@ open class ReaderPageImageView @JvmOverloads constructor(
         isImageShown = false
         stripRequest?.dispose()
         stripRequest = null
-        // A promotion that was still loading is dropped, not left waiting for a page that is gone
+        // A promotion that was still loading is dropped, not left waiting for a page that is gone.
+        // Out of the tree only, and not recycled: `recycle()` closes the file, and a load that has
+        // started is still copying out of it. The task holds this view, so the file is let go when
+        // the task is done; closing it here is a free ahead of that work, which is what a page that
+        // was mid-load when the reader moved on crashes on.
         detailView?.let {
-            it.recycle()
             removeView(it)
         }
         detailView = null
@@ -320,9 +341,39 @@ open class ReaderPageImageView @JvmOverloads constructor(
      * passed on, because the image reads it while handling that very same event.
      */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // Whether the taps of a double tap reached this view at all, and where they landed. A lost
+        // double tap is told from a refused one here: a refused one reaches the image and logs a run
+        // of `act=zoom` that ends back at its own `fit=`, and a lost one logs no such run, so the
+        // pair of events is what separates the two. A move is left out — it fires every frame of a
+        // pan and says nothing about whether a tap was seen.
+        val suppressed = isDoubleTapZoomSuppressed?.invoke(ev) == true
+        // Only the events that say a finger went down or left: a move fires every frame of a pan, and
+        // the masked action never reports a second finger down, so `fingers=` is what tells a tap from
+        // the start of a pinch.
+        if (
+            ev.actionMasked == MotionEvent.ACTION_DOWN ||
+                ev.actionMasked == MotionEvent.ACTION_UP ||
+                ev.actionMasked == MotionEvent.ACTION_CANCEL
+        ) {
+            // What the view that would receive this touch says of itself, which is what the library
+            // checks before it will accept a double tap: it aborts the touch when the image is not
+            // ready, and it only starts a quick scale when zoom and quick scale are both on. A view
+            // that answers a tap and no other does is told apart here.
+            val target = pageView as? SubsamplingScaleImageView
+            metrics(
+                "tap",
+                zoomPage,
+                "who=$zoomSubject action=${touchActionName(ev.actionMasked)} fingers=${ev.pointerCount} at=${ev.x.toInt()}x${ev.y.toInt()} sup=$suppressed" +
+                    if (target != null) {
+                        " ready=${target.isReady()} zoom=${target.isZoomEnabled()} quick=${target.isQuickScaleEnabled()}"
+                    } else {
+                        " none"
+                    },
+            )
+        }
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                if (isDoubleTapZoomSuppressed?.invoke(ev) == true) {
+                if (suppressed) {
                     (pageView as? SubsamplingScaleImageView)?.let { view ->
                         view.setZoomEnabled(false)
                         isZoomSuppressed = true
@@ -343,6 +394,34 @@ open class ReaderPageImageView @JvmOverloads constructor(
     }
 
     /**
+     * What a touch event was, named for the log. A double tap is two of these, and the pair is what
+     * says whether the gesture was lost or refused, so the events are read by hand. Note that the
+     * masked action never reports a second finger down — that is only in the raw action — which is
+     * what `fingers=` is for: a one that stays at 1 is a tap, a two that reaches 2 is a pinch.
+     */
+    private fun touchActionName(action: Int) = when (action) {
+        MotionEvent.ACTION_DOWN -> "down"
+        MotionEvent.ACTION_UP -> "up"
+        MotionEvent.ACTION_CANCEL -> "cancel"
+        else -> "$action"
+    }
+
+    /**
+     * What started a scale change, named for the log rather than left as the library's number: a
+     * report of zoom events is read by hand, and which gesture was refused is the whole question. The
+     * library reports a double tap as 4 because its own gesture detector answers the double tap and
+     * then animates, so a double tap never reaches the touch path that would report 2 — which is why
+     * a run of pinches shows up as no lines at all, and an absence cannot be told from a refusal.
+     */
+    private fun zoomOriginName(origin: Int) = when (origin) {
+        SubsamplingScaleImageView.ORIGIN_DOUBLE_TAP_ZOOM -> "doubletap"
+        SubsamplingScaleImageView.ORIGIN_TOUCH -> "pinch"
+        SubsamplingScaleImageView.ORIGIN_FLING -> "fling"
+        SubsamplingScaleImageView.ORIGIN_ANIM -> "anim"
+        else -> "$origin"
+    }
+
+    /**
      * A view that draws a still page, with the touch behaviour the reader expects of one. Made twice:
      * for the page itself, and for the file's own detail beside it (see
      * [promoteToFullDetail]) — the second one is zoomed and panned by the reader just like the first,
@@ -355,6 +434,13 @@ open class ReaderPageImageView @JvmOverloads constructor(
         setOnStateChangedListener(
             object : SubsamplingScaleImageView.OnStateChangedListener {
                 override fun onScaleChanged(newScale: Float, origin: Int) {
+                    // The limits as the view holds them at the moment the reader asked, which is what
+                    // decides whether the gesture was allowed at all: `minScale()` is the fit for the
+                    // source this view holds, and `maxScale` is the ceiling written when the image
+                    // reported ready. A double tap whose target is at or below the current scale
+                    // divided by 0.9 is answered by zooming *out*, so a page that looks like it will
+                    // not zoom at all reads as this line repeating with `to=` unchanged.
+                    metrics("zoom", zoomPage, "who=$zoomSubject to=$newScale fit=$minScale max=$maxScale by=${zoomOriginName(origin)}")
                     this@ReaderPageImageView.onScaleChanged(newScale)
                 }
 
@@ -375,16 +461,89 @@ open class ReaderPageImageView @JvmOverloads constructor(
     }
 
     private fun SubsamplingScaleImageView.setupZoom(config: Config?) {
-        // 5x zoom
-        maxScale = scale * MAX_ZOOM_SCALE
-        setDoubleTapZoomScale(scale * 2)
+        // The ceiling is a multiple of the fit for the source this view holds, not of the scale the
+        // view happens to be at: the library's `maxScale` is a plain absolute it never derives from
+        // the file, and its own floor is the fit — the scale at which the source just fills the
+        // viewport — which is what `minScale()` answers. A view set up for the first time is at that
+        // fit when this runs, so the two readings agree; a view that is set up again while it still
+        // holds a zoom from an earlier visit would otherwise take a multiple of that zoom, and each
+        // visit would compound it.
+        val fit = minScale
+        metrics("zoomset", zoomPage, "who=$zoomSubject fit=$fit max=${fit * MAX_ZOOM_SCALE} tap=${fit * 2}")
+        maxScale = fit * MAX_ZOOM_SCALE
+        setDoubleTapZoomScale(fit * 2)
 
         when (config?.zoomStartPosition) {
-            ZoomStartPosition.LEFT -> setScaleAndCenter(scale, PointF(0F, 0F))
-            ZoomStartPosition.RIGHT -> setScaleAndCenter(scale, PointF(sWidth.toFloat(), 0F))
-            ZoomStartPosition.CENTER -> setScaleAndCenter(scale, center)
+            ZoomStartPosition.LEFT -> setScaleAndCenter(fit, PointF(0F, 0F))
+            ZoomStartPosition.RIGHT -> setScaleAndCenter(fit, PointF(sWidth.toFloat(), 0F))
+            // The middle of the source, not the middle of the screen as the view reads it now: for a
+            // view that is being set up again the second is wherever the reader left it
+            ZoomStartPosition.CENTER -> setScaleAndCenter(fit, PointF(sWidth / 2f, sHeight / 2f))
             null -> {}
         }
+    }
+
+    /**
+     * Moves the reader's zoom and pan from the view that is being replaced to the one that is taking
+     * over, so a page that was zoomed while its detail loaded keeps the reader's position when the
+     * detail arrives rather than dropping back to the whole page.
+     *
+     * The two scales are not the same number and cannot be copied: each is screen pixels per source
+     * pixel, so the same on-screen size is the preview's scale against the preview's own pixels and
+     * the new view's scale against the file's. The factor between them is the ratio of the two fits,
+     * and a fit is what the library calls `minScale()` — the scale at which each source just fits the
+     * viewport — which is also the value the zoom log prints.
+     *
+     * The center is stored in source coordinates, so it is moved through the screen translation the
+     * two views share rather than copied.
+     *
+     * The result is clamped to the new view's own limits, which is what keeps a position that was
+     * legal on the preview legal here. A zoom that is still animating when the load finishes is not
+     * readable to its end — the library keeps the animation it started private — so this is the
+     * reader's position at the moment of the swap, and the clamp is what keeps it legal. The
+     * transition is not continued on the new view: it starts at the position above, already settled.
+     */
+    private fun SubsamplingScaleImageView.carryPositionFrom(preview: SubsamplingScaleImageView) {
+        val previewCenter = preview.center ?: return
+        val previewFit = preview.minScale
+        val fit = minScale
+        if (previewFit <= 0F || fit <= 0F) return
+        // A reader that has not zoomed is already at the fit of the new view, so there is nothing to
+        // move and no position to overwrite
+        if (preview.scale <= previewFit) return
+        val target = (preview.scale * (fit / previewFit)).coerceIn(fit, maxScale)
+        val translateX = preview.width / 2f - preview.scale * previewCenter.x
+        val translateY = preview.height / 2f - preview.scale * previewCenter.y
+        setScaleAndCenter(target, PointF((width / 2f - translateX) / target, (height / 2f - translateY) / target))
+    }
+
+    /**
+     * Puts a page back at the position it shows at when the reader first comes to it, for the reader
+     * has moved on from the page.
+     *
+     * A holder keeps its view across the turns the reader makes past it, so a zoom and a pan the reader
+     * set on a page stay on that view until something else writes them, and the next time the reader
+     * comes back they arrive at a page that is already zoomed somewhere. That position is in the units
+     * of whichever of the two views was last drawn — the file's pixels or the prepared ones — and the
+     * view that is up now is the other one, which is what makes a previous visit's zoom read further
+     * in or panned to the other side. The position is not carried back out of the file's view into the
+     * prepared one, as it is carried forward at [promoteToFullDetail]: the reader has left the page, so
+     * there is no one to keep it for. The ceiling is written again from the fit rather than left at
+     * what the last visit set from a scale that was already zoomed, which is what stops it compounding
+     * across visits.
+     *
+     * [RESET_ZOOM_ON_LEAVE] is what this is asked for under; with it off the state is left as it was
+     * and a page keeps its reader's zoom across the turn, which is the behaviour the drift above is
+     * measured against.
+     */
+    fun resetZoomFor(config: Config) {
+        if (!RESET_ZOOM_ON_LEAVE) return
+        val view = pageView as? SubsamplingScaleImageView ?: return
+        // A view that has not measured its source has no fit to write a ceiling from, and nothing of
+        // the reader's that it could let go
+        if (!view.isReady()) return
+        view.resetScaleAndCenter()
+        view.setupZoom(config)
     }
 
     /**
@@ -446,13 +605,20 @@ open class ReaderPageImageView @JvmOverloads constructor(
      *
      * Only a page already drawn by a still view can be promoted; anything else has nothing prepared to
      * bring up. A page that cannot be read from the file again keeps what it was showing.
+     *
+     * [onLoadEnd] is called when the load this starts is over, however it ended — swapped in, failed, or
+     * left behind by a reader that moved on before it was drawn again. It is the view that knows that
+     * moment and the holder that owns what the load was holding a place for, so the view is told and
+     * calls it; the gate is not named here, because this view is built for covers and strips too, where
+     * there is no gate to hold a place. Answers whether a load was started, so a caller that asked for a
+     * place before this call can let go of one that was never used.
      */
-    fun promoteToFullDetail(source: BufferedSource, config: Config) {
-        if (pageView !is SubsamplingScaleImageView) return
+    fun promoteToFullDetail(source: BufferedSource, config: Config, onLoadEnd: (() -> Unit)? = null): Boolean {
+        if (pageView !is SubsamplingScaleImageView) return false
         // A page that already has a detail view loading has one. A second would leave the first out of
         // every field, so it would never be swapped in, never be removed from the tree and never be
         // recycled — a whole tile pyramid held for nothing.
-        if (detailView != null) return
+        if (detailView != null) return false
 
         val detail = newSubsamplingImageView()
         detailView = detail
@@ -460,14 +626,25 @@ open class ReaderPageImageView @JvmOverloads constructor(
         detail.setOnImageEventListener(
             object : SubsamplingScaleImageView.DefaultOnImageEventListener() {
                 override fun onReady() {
+                    // The load is over, however it went, so the place it was holding is let go first:
+                    // by the time the fields below are read, `detailView` is already its null, and a
+                    // load that was left behind by a reader that moved on answers here with nothing
+                    // left to swap.
+                    onLoadEnd?.let { it() }
                     val loaded = detailView ?: return
                     val preview = pageView as? SubsamplingScaleImageView ?: return
                     // The swap happened: the file is on screen and what was is taken away in the same
-                    // moment. No page id — the image view does not know the page — so this line is read
-                    // against the holder's `act=promote` for the same page by what surrounds it, and the
-                    // holder logs `act=shown` for the page right after it.
-                    metrics("swap", null, "")
+                    // moment. The page id is the holder's, handed over for the zoom log, so a line that
+                    // has none is one whose holder never set it — a view made outside a page holder.
+                    metrics("swap", zoomPage, "")
+                    // From here the gestures reach the file's own view, whose fit is the file's, not the
+                    // viewport's, and whose ceiling was just written from that fit.
+                    zoomSubject = "detail"
                     loaded.setupZoom(config)
+                    // The ceiling has to exist before the position is moved over: the move is clamped
+                    // to it, and a ceiling of the library's default of two would put the reader's
+                    // position outside the range the new view allows.
+                    loaded.carryPositionFrom(preview)
                     loaded.isVisible = true
                     // The prepared view is taken out of the tree but kept, not recycled: it is what
                     // this page goes back to when the reader moves on, and its pixels are the cache's
@@ -480,6 +657,8 @@ open class ReaderPageImageView @JvmOverloads constructor(
                 }
 
                 override fun onImageLoadError(e: Exception) {
+                    // The load is over, and this is the only end it answers at, so the place comes first
+                    onLoadEnd?.let { it() }
                     // The file could not be read again. Without this line the promotion is silent: the
                     // preview stays up and nothing says a swap was tried and failed, which is how a page
                     // that never gets its detail looks the same as one that was never promoted.
@@ -493,6 +672,16 @@ open class ReaderPageImageView @JvmOverloads constructor(
                 }
             },
         )
+        // The loading view goes behind the preview rather than over it. It paints nothing until it has
+        // tiles, so the preview is what the reader sees either way — but a view that is on top is what
+        // receives the touches, and the library answers a touch on a view that is not ready by
+        // consuming it before its double-tap detector is ever fed, so a view left over its preview
+        // would swallow every gesture for the whole length of the load: a page that is still loading
+        // takes no zoom, no pan and no fling, and only a single tap still turns pages because that
+        // one has its own detector.
+        // The order is set before the view is added: `View` sorts its children as a child is inserted,
+        // and setting the order afterwards only invalidates without re-sorting.
+        detail.setZ(-1f)
         addView(detail, MATCH_PARENT, MATCH_PARENT)
         // The view is left drawable rather than hidden: the library reads the file when it is first
         // drawn, and a view that is never drawn is never read, so an invisible one would sit out its
@@ -503,6 +692,9 @@ open class ReaderPageImageView @JvmOverloads constructor(
         // is put back to its prepared pixels is promoted again the next time the reader stops on it,
         // and a source the first promotion consumed would answer the second with nothing at all.
         detail.setImage(ImageSource.inputStream(source.peek().inputStream()))
+        // A load was started, so whatever was held for it before this call is still held: the listeners
+        // above are what let it go, at whichever of the two ends this load answers.
+        return true
     }
 
     /**
@@ -525,6 +717,8 @@ open class ReaderPageImageView @JvmOverloads constructor(
         preview.isVisible = true
         pageView = preview
         previewView = null
+        // The gestures reach the prepared pixels again, whose fit is the viewport's
+        zoomSubject = "page"
         return true
     }
 
@@ -534,16 +728,22 @@ open class ReaderPageImageView @JvmOverloads constructor(
      *
      * A promotion that has not swapped yet has no prepared view kept aside — the preview is still the
      * page — so there is nothing to swap back and the only thing to do is stop the load. Removing the
-     * view from the tree is what stops it: the library reads a file when it is first drawn, so a view
-     * that is not drawn has no decode left in it. This is what keeps a fast scroll from queueing a
-     * full decode per page, which is what runs the app out of heap.
+     * view from the tree is what stops the rest of it: the library reads a file when it is first drawn,
+     * so a view that is not drawn has no decode left to start. What has started is left to finish, and
+     * the view is not recycled because that closes the file the started read is still copying out of —
+     * the task holds the view, so the file is given back when it is done. This is what keeps a fast
+     * scroll from queueing a full decode per page, which is what runs the app out of heap.
      *
-     * Answers whether there was one to let go of.
+     * Answers whether there was one to let go of. A load that had been drawn answers one of the two
+     * listeners above when it finishes, and that is where the caller lets go of whatever it was holding
+     * for the load; a load that never was drawn answers neither, so the caller has to let go of it here
+     * rather than wait for an answer that will not come.
      */
     fun cancelPromotion(): Boolean {
         val detail = detailView ?: return false
         removeView(detail)
-        detail.recycle()
+        // Not recycled: the tile-init task this view started is still reading the file, and `recycle()`
+        // closes it mid-read. The task holds the view, so the file is given back when it finishes.
         detailView = null
         return true
     }
@@ -689,3 +889,14 @@ open class ReaderPageImageView @JvmOverloads constructor(
 }
 
 private const val MAX_ZOOM_SCALE = 5F
+
+/**
+ * Whether the reader's zoom and pan are set back to the page's own when the reader moves on from it,
+ * which is what [ReaderPageImageView.resetZoomFor] does.
+ *
+ * Off, a page keeps whatever position the reader left on it for as long as its holder is on screen, and
+ * that position is in the units of the view that was drawn last, so it reads differently on the view
+ * that is up when the reader comes back. On, each visit starts from the page as it fills the screen and
+ * the position is only ever the reader's current one.
+ */
+private const val RESET_ZOOM_ON_LEAVE = true

@@ -109,6 +109,30 @@ class PagerPageHolder(
     private var promotionCancelled = false
 
     /**
+     * Job for a promotion that is waiting at the gate for a place, kept as a job so the wait can be
+     * let go when the reader moves on before the place is free — the same cancellation the read-back
+     * above it gets. The wait is a job rather than the call because a promotion is asked for from the
+     * turn that made this page the one being read, and a turn is not spent waiting for a place.
+     */
+    private var promotionLoadJob: Job? = null
+
+    /**
+     * The place the current promotion is holding at the gate, and the thing that lets go of it once the
+     * load it was for is over.
+     *
+     * A promotion is the same kind of work as a page's own decode as far as memory goes — the view
+     * reads the file at the file's own resolution, and for the formats the library sends to its own
+     * decoder that is a whole frame of the page held at once, which is what three of them being alive
+     * at a time was: nothing else bounds the pool those loads run on. So the promotion asks the gate
+     * for a place on the same allowance, and this is what lets go of it. It is held here rather than
+     * only in the job that took it because the moment a load is over is answered in the view, which is
+     * what reads the file; and because a load that was never drawn again answers nothing at all, which
+     * is why [demoteToPrepared] and [onDetachedFromWindow] let go of the place too when they find one
+     * that will never answer. The same place is never let go twice: the closure checks.
+     */
+    private var promotionRelease: (() -> Unit)? = null
+
+    /**
      * When this holder was made, measured against when the image is drawn. A fresh one for a page
      * that was already on screen is a re-decode, which is what the log is for.
      */
@@ -116,11 +140,17 @@ class PagerPageHolder(
 
     init {
         metrics("holder", page, "")
+        // Before the load starts, so the gate knows how many pages there are to ask before any of the
+        // reads it starts has had time to finish
+        viewer.decodeGate.register()
         loadJob = scope.launch { loadPageAndProcessStatus() }
         // A double tap on a tap zone turns pages, so it must not be spent on zooming the image
         isDoubleTapZoomSuppressed = { event ->
             viewer.config.tapZonesImmediate && viewer.isTapZone(event)
         }
+        // The zoom log is written by the view, which is not given a page; the holder is what knows it,
+        // and a fit alone cannot tell two pages of the same size apart
+        zoomPage = page
     }
 
     /**
@@ -142,6 +172,18 @@ class PagerPageHolder(
             job.cancel()
         }
         promotionJob = null
+        // And one that is waiting at the gate for a place it will never be asked for again
+        promotionLoadJob?.let { job ->
+            promotionCancelled = true
+            job.cancel()
+        }
+        promotionLoadJob = null
+        // A load that had already started answers its own end, and a page that is off screen wants
+        // nothing from it; a load that was never drawn again answers nothing, so this is the only
+        // place that lets go of its place. The closure checks, so the load's own end is left alone
+        // when it does answer.
+        promotionRelease?.let { it() }
+        promotionRelease = null
     }
 
     private fun initProgressIndicator() {
@@ -248,6 +290,8 @@ class PagerPageHolder(
                 // own to bring up to detail when the reader stops on it. That is what [fromCache] says,
                 // and what makes the promotion read the file back at that moment.
                 fromCache = true
+                // Nothing is decoded here, so this page asks for nothing at the gate
+                viewer.decodeGate.withdraw()
                 metrics("hit", page, "bytes=${cached.allocationByteCount}")
                 withContext(Dispatchers.Main) {
                     setImage(cached, config)
@@ -294,6 +338,8 @@ class PagerPageHolder(
             val decodedAt = metricsTime()
             val bitmap =
                 if (isAnimated || !isLeadPage) {
+                    // Nothing is decoded for this page, and the gate's wave counts it as having said so
+                    viewer.decodeGate.withdraw()
                     null
                 } else {
                     // The window's bound is on how much work runs at once, and memory is a different
@@ -303,19 +349,27 @@ class PagerPageHolder(
                     // a proxy for the frame, not the frame: only the decoder knows the real size, and by
                     // then the frame is already allocated, so this decides how many such pages are
                     // decoded at a time, never whether one is.
-                    val lane =
-                        if (bytes > BIG_DECODE_BYTES) {
-                            viewer.bigDecodeDispatcher
-                        } else {
-                            viewer.decodeDispatcher
+                    val big = bytes > BIG_DECODE_BYTES
+                    // Asked for on the UI thread, before the decode hops away, and given back from the
+                    // same block it was taken in — that is what lets the gate hold no lock. The place is
+                    // waited for rather than taken by force, so a page that is not near the reading
+                    // position is queued behind the ones that are rather than competing with them. The
+                    // question is handed over rather than its answer, so being near the reading position
+                    // is read again every time the gate decides, rather than fixed at the moment this
+                    // page joined the queue — a page the reader jumped to is let through ahead of one
+                    // they jumped past, even when the second asked first.
+                    val slot = viewer.decodeGate.take({ viewer.decodePriority(page) }, big)
+                    try {
+                        withContext(Dispatchers.Default) {
+                            try {
+                                decodeToBitmap(source, viewer.screenWidth, viewer.screenHeight)
+                            } catch (e: Throwable) {
+                                logcat(LogPriority.ERROR, e)
+                                null
+                            }
                         }
-                    withContext(lane) {
-                        try {
-                            decodeToBitmap(source, viewer.screenWidth, viewer.screenHeight)
-                        } catch (e: Throwable) {
-                            logcat(LogPriority.ERROR, e)
-                            null
-                        }
+                    } finally {
+                        viewer.decodeGate.give(slot)
                     }
                 }
             val decoded = metricsSince(decodedAt)
@@ -396,6 +450,12 @@ class PagerPageHolder(
      * same thing; it is only that its file was never read, which is what the cache hit skipped, so for
      * that one the file is read back here first. The prepared pixels stay in the cache either way:
      * scrolling back over this page is answered by them again, and it promotes again.
+     *
+     * The load is asked for at the gate for a place, like a page's own decode is, and the wait for one
+     * is never spent here: both the read-back and the promotion run as jobs, so the turn that made
+     * this page the one being read stays a turn. A promotion is always for the page the reader is on,
+     * so it asks with the best rank and is next in line for a free place rather than behind the pages
+     * that were built first.
      */
     fun promoteToFullDetail() {
         // Read first, so the method is safe to call at either time a page can become the one being
@@ -405,7 +465,8 @@ class PagerPageHolder(
         }
         val source = preparedSource
         if (source != null) {
-            startPromotion(source)
+            // The file is here, so only the load is left, and it waits at the gate for a place
+            schedulePromotion(source)
             return
         }
         // No file in hand. Only a page that is on screen from cached pixels still wants one — a page
@@ -424,15 +485,17 @@ class PagerPageHolder(
                 val buffer = withContext(Dispatchers.IO) { streamFn().use { Buffer().readFrom(it) } }
                 val file = withContext(Dispatchers.Default) { process(item, buffer) }
                 withContext(Dispatchers.Main) {
-                    promotionJob = null
                     // Held for as long as the page is on screen, like a prepared page's is: the file is
                     // here for the next time the reader stops on it, and let go when the view is detached
                     preparedSource = file
                     // The reader may have moved on while the file was being read, and a page they left
                     // keeps its prepared pixels
                     if (viewer.isCurrent(page)) {
+                        // Kept as this job until the load is asked for, so a reader who moves on in the
+                        // wait at the gate stops this promotion the way they stop the read above it
                         startPromotion(file)
                     }
+                    promotionJob = null
                 }
             } catch (e: Throwable) {
                 promotionJob = null
@@ -449,11 +512,72 @@ class PagerPageHolder(
      * Hands the view the file and says so. Split out because the file arrives at two moments: the one
      * a prepared page already has, and the one a page whose pixels came back from the cache has to
      * read back first.
+     *
+     * The place at the gate is held for the length of the load the view starts, not of this call: the
+     * load is what allocates a whole-resolution frame, and it is the view that knows when that is over,
+     * so the view is given [promotionRelease] and calls it at the end of the load — swapped in, failed,
+     * or left behind by a reader that moved on. A promotion is always for the page the reader is on, so
+     * it asks with the best rank. It is not counted against the gate's wave: the wave is about the pages
+     * that could ask, and this is not one of them — a holder that is being promoted has long finished
+     * asking, and counting it would settle the first wave before the pages that had not asked yet had.
+     *
+     * A page that is not drawn by a still view, or that already has a detail loading, starts no load and
+     * lets go of the place it took straight away.
      */
-    private fun startPromotion(source: BufferedSource) {
+    private suspend fun startPromotion(source: BufferedSource) {
         val from = viewer.bitmapCache.find(page)?.let { "from=${it.width}x${it.height}" } ?: ""
-        promoteToFullDetail(source, imageConfig())
+        val slot = viewer.decodeGate.take({ viewer.decodePriority(page) }, big = true, wave = false)
+        // The place is let go by whichever end of the load answers first, and only once: a load that
+        // was never drawn answers nothing and is let go by the holder instead, which reaches the same
+        // closure.
+        var released = false
+        val release = {
+            if (!released) {
+                released = true
+                viewer.decodeGate.give(slot)
+            }
+        }
+        promotionRelease = release
+        val started =
+            try {
+                promoteToFullDetail(source, imageConfig(), release)
+            } catch (e: Throwable) {
+                release()
+                promotionRelease = null
+                throw e
+            }
+        if (!started) {
+            release()
+            promotionRelease = null
+        }
         metrics("promote", page, from)
+    }
+
+    /**
+     * Runs [startPromotion] away from whoever called this, so the wait at the gate is not spent on a
+     * turn. Cancellable like the read-back it sits beside: a reader that moved on before the place was
+     * free leaves no promotion behind, and a place that was already taken is let go by the gate itself
+     * when the job is stopped.
+     */
+    private fun schedulePromotion(source: BufferedSource) {
+        // One promotion at a time: a second would hold a place of its own while the first is still
+        // waiting for one
+        if (promotionLoadJob != null) {
+            return
+        }
+        promotionCancelled = false
+        promotionLoadJob = scope.launch {
+            try {
+                startPromotion(source)
+                promotionLoadJob = null
+            } catch (e: Throwable) {
+                promotionLoadJob = null
+                // A wait that was stopped because the reader moved on is not a failure
+                if (!promotionCancelled) {
+                    logcat(LogPriority.ERROR, e)
+                }
+            }
+        }
     }
 
     /**
@@ -468,6 +592,11 @@ class PagerPageHolder(
      * nothing to swap back — the prepared view is still the page — so for that one the load is let go
      * instead, which is what keeps a fast scroll from queueing a full decode per page. A page whose
      * file is still being read back for it is let go the same way, before the read is spent.
+     *
+     * The reader's zoom and pan are let go here too, once the swap has put the prepared view back: a
+     * holder keeps its view across the turns the reader makes past it, so a position left on a page
+     * would otherwise be there for the next visit to arrive at, in the units of the view that was
+     * drawn last rather than the one that is up now.
      */
     fun demoteToPrepared() {
         // A file the reader is no longer asking for is not worth reading, and this is the moment they
@@ -477,11 +606,32 @@ class PagerPageHolder(
             job.cancel()
         }
         promotionJob = null
+        // And a promotion that had not got a place at the gate yet, which is the same thing: the reader
+        // stopped asking for this page, so the load is not coming
+        promotionLoadJob?.let { job ->
+            promotionCancelled = true
+            job.cancel()
+        }
+        promotionLoadJob = null
         if (demoteToCached()) {
             metrics("demote", page, "")
         } else if (cancelPromotion()) {
+            // The load is let go, and so is its place. A load that was never drawn again answers
+            // nothing — removing the view is what leaves it no decode to start — so this is the only
+            // place that would let go of it, and for that one the place is exactly what was held. A
+            // load that had started answers its own end later; the closure checks, so what this frees
+            // here is only the tail of a load the reader has already left, which is the same
+            // over-run the load itself is left to finish with.
+            promotionRelease?.let { it() }
+            promotionRelease = null
             metrics("cancel", page, "")
         }
+        // The reader has left this page, so whatever they set on it is let go here rather than left for
+        // the next visit to find. It comes after the swap on purpose: the reset writes the ceiling from
+        // the fit of the view that is up now, and after a swap that is the prepared one. A page that
+        // was never promoted takes the same call — it holds a zoom of its own from an earlier visit,
+        // which is the drift this is here to end.
+        resetZoomFor(imageConfig())
     }
 
     /**
@@ -595,6 +745,11 @@ class PagerPageHolder(
      * Called when the page has an error.
      */
     private fun setError(error: Throwable?) {
+        // A page that could not be read asks for nothing at the gate, which is what lets the wave
+        // settle when one of its pages fails: counted as said, not as still to come. A page that
+        // fails after it had already asked is counted twice, and the only effect of counting a wave
+        // as settled early is that a page takes its place by arrival rather than by rank.
+        viewer.decodeGate.withdraw()
         progressIndicator?.hide()
         showErrorLayout(error)
     }

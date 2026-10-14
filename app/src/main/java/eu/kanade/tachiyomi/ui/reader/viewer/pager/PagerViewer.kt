@@ -16,13 +16,13 @@ import eu.kanade.tachiyomi.ui.reader.model.ChapterTransition
 import eu.kanade.tachiyomi.ui.reader.model.InsertPage
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.model.ViewerChapters
+import eu.kanade.tachiyomi.ui.reader.viewer.DecodeGate
 import eu.kanade.tachiyomi.ui.reader.viewer.PageBitmapCache
 import eu.kanade.tachiyomi.ui.reader.viewer.Viewer
 import eu.kanade.tachiyomi.ui.reader.viewer.ViewerNavigation.NavigationRegion
 import eu.kanade.tachiyomi.ui.reader.viewer.metrics
 import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
 import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import mihon.app.di.appGraph
@@ -65,24 +65,25 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
     val bitmapCache = PageBitmapCache()
 
     /**
-     * Pages away from the one being read are decoded here, five at a time. A page that is only being
-     * given lead time must not stand in the way of the one being read, and left unbounded the whole
+     * Who may be decoding a page, and who gets a free place next. Pages away from the one being read
+     * are decoded here rather than by the view at layout time, which keeps the whole of it off the main
+     * thread and, for a page that is only being given lead time, off the turn. Left unbounded the whole
      * window would be inflating at once, each page at its full size — this is the bitmap path's
-     * counterpart to the strip decoder's single-permit semaphore. Five at a time is where a batch of
-     * pages clears faster than it empties the window; what it pays is the peak, since each of the five
-     * holds the file's own pixels while it inflates them. Anything past the five queues.
+     * counterpart to the strip decoder's single-permit semaphore.
+     *
+     * The two allowances are counted in pages, not in bytes, and are split because memory and work are
+     * not the same number: a page whose file is over [BIG_DECODE_BYTES] inflates to a frame of a few
+     * hundred MB (the measured one was a 13MB file over a 140MB frame) and the app's heap is 512MB, so
+     * the small allowance's worth of those at once is an allocation that cannot be made at all rather
+     * than a slow turn. What the file's size decides is how many such pages are decoded at a time,
+     * never whether one is; only the decoder knows the real frame size, and by then it is allocated.
+     *
+     * What the gate adds over two bounded dispatchers is the order the places are handed out. A
+     * `limitedParallelism(n)` dispatcher is a fair queue, so the page whose holder was built first gets
+     * a place first — and the pager builds holders left to right, so opening a chapter on its last-read
+     * page puts the page the reader is about to turn to last in the queue.
      */
-    val decodeDispatcher = Dispatchers.Default.limitedParallelism(5)
-
-    /**
-     * The same work, one at a time, for a page whose file is big enough that its pixels at the file's
-     * own resolution are a few hundred MB. The limit above is about how much work runs at once; what
-     * bounds this case is memory, and the two are not the same number. The measured page was a 13MB
-     * file over a 140MB frame, and the app's heap is 512MB, so five of those frames decoding together
-     * is already past it — that is an allocation the collector cannot make, not a slow turn. One at a
-     * time keeps a page like this decodable at all.
-     */
-    val bigDecodeDispatcher = Dispatchers.Default.limitedParallelism(2)
+    val decodeGate = DecodeGate(5, 2)
 
     /**
      * The screen a page is asked to fill, which is what pixels prepared ahead are sized to. The
@@ -217,6 +218,42 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
      * take the path that shows it as it is asked for, rather than the one that prepares it ahead.
      */
     fun isCurrent(page: ReaderPage): Boolean = currentPage === page
+
+    /**
+     * How wanted a page's decode is right now, lower first, which is the order [DecodeGate] hands its
+     * places out in. A holder asks as it reaches the gate, so the pages near the reading position are
+     * the ones that get a place first.
+     *
+     * Signed and forward-weighted: the reader is more likely to keep going than to go back, so the two
+     * pages ahead of the one being read come first, then the one behind, then the next two ahead —
+     * +1, +2, -1, +3, +4, -2. A page behind is not unimportant (it is where the reader came from),
+     * it is just less wanted than the ones they are heading into.
+     *
+     * This is deliberately not [PageBitmapCache.trimTo]'s ranking, which is a distance with no
+     * direction. That is right for letting pixels go — a page equally far on either side is equally
+     * worth dropping — and wrong for deciding what to decode next, where the two directions are not
+     * the same question.
+     */
+    fun decodePriority(page: ReaderPage): Int {
+        val current = currentPage ?: return 0
+        val from = adapter.items.indexOf(current)
+        val to = adapter.items.indexOf(page)
+        if (from == -1 || to == -1) {
+            // A page that is not in the running order, which is nothing the reader can be near
+            return 1 shl 20
+        }
+        val ahead = to - from
+        if (ahead == 0) {
+            return 0
+        }
+        // Ahead pages are grouped in pairs and each pair is followed by one page behind, so the order
+        // is the one described above: +1, +2, -1, +3, +4, -2. Only the ahead side is grouped in pairs
+        // — a page behind is one per group, the third of the group its distance puts it in. Grouping
+        // the behind side in pairs too is what made a page two behind level with a page three ahead,
+        // and ahead of the four ahead that the reader is heading into.
+        val steps = if (ahead > 0) ahead else -ahead
+        return if (ahead > 0) 3 * ((steps - 1) / 2) + (steps - 1) % 2 else 3 * steps - 1
+    }
 
     /**
      * Returns the PagerPageHolder for the provided page

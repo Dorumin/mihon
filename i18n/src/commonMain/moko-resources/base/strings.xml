@@ -411,6 +411,8 @@
     <string name="pref_page_transitions">Animate page transitions</string>
     <string name="pref_load_ahead_only_over_wifi">Load ahead only on Wi-Fi</string>
     <string name="pref_load_ahead_only_over_wifi_summary">Saves mobile data by loading only the pages near the one you\'re reading</string>
+    <string name="pref_preload_page_bitmaps">Preload pages ahead of turning</string>
+    <string name="pref_preload_page_bitmaps_summary">Decode the pages around the one you\'re reading ahead of time, so turning to them shows them right away. Keeps those pages in memory, within a limit; turn off if a chapter runs out of it, which also makes the reader look ahead less far and wait for the decode when it turns.</string>
     <string name="pref_flash_page">Flash on page change</string>
     <string name="pref_flash_page_summ">Reduces ghosting on e-ink displays</string>
     <string name="pref_flash_duration">Flash duration</string>

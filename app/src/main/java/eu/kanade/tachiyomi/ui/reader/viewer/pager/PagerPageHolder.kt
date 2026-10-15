@@ -141,7 +141,9 @@ class PagerPageHolder(
     init {
         metrics("holder", page, "")
         // Before the load starts, so the gate knows how many pages there are to ask before any of the
-        // reads it starts has had time to finish
+        // reads it starts has had time to finish. This is asked for whatever the setting says, so the
+        // wave's counts stay balanced when pages say they want nothing; with the setting off nothing
+        // asks, and a gate that is never asked admits nothing.
         viewer.decodeGate.register()
         loadJob = scope.launch { loadPageAndProcessStatus() }
         // A double tap on a tap zone turns pages, so it must not be spent on zooming the image
@@ -159,6 +161,24 @@ class PagerPageHolder(
     @SuppressLint("ClickableViewAccessibility")
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        // What this holder was holding as it left the window, read before anything is let go. How many
+        // images are alive at once is what decides whether a tight chapter fits, and a page that left
+        // the window and a page whose pixels were never let go look the same in the log unless they
+        // say what they held. `view=` is the image view that is still up and what it was given — one
+        // that answers anything but "none" is a page whose pixels only the collector will free, which
+        // is the gap between a page being unloaded and its memory being available for the next one.
+        // `loading=` is whether an image this view is drawing is still being read, which is what says
+        // whether it can be let go at all; `src=` is a file kept for a promotion, `bg=` and `promo=`
+        // are work still running when it stopped, `place=` is a promotion still holding a place at the
+        // gate, and `releasable=` is whether the image was let go below. The page's own load is left
+        // out of the line: it is the status subscription, which is still running for every page that
+        // was ever asked for.
+        val held = heldImageView()
+        val loading = imageLoadRunning()
+        val hadSource = preparedSource != null
+        val bg = backgroundJob != null
+        val promo = promotionJob != null || promotionLoadJob != null
+        val place = promotionRelease != null
         loadJob?.cancel()
         loadJob = null
         // Otherwise a page that was only looked at for a moment keeps a full bitmap alive
@@ -184,6 +204,29 @@ class PagerPageHolder(
         // when it does answer.
         promotionRelease?.let { it() }
         promotionRelease = null
+        // A page that left the window used to keep its image up until the holder was collected, which
+        // is the gap between a page being unloaded and its memory being available for the next one —
+        // and the next page's holder is built in this same moment, which is what a tight chapter
+        // crashes on. So let go now, when it can be let go at all. `recycle()` gives back the file
+        // and the pixels, so a view whose image is still being read cannot be touched at all: the
+        // read is a native write into the pixels this call frees, which is a use-after-free rather
+        // than an error. And a view that is on screen from prepared pixels is drawing a bitmap the
+        // page cache holds, which is not this holder's to give back — the cache's check for a
+        // recycled bitmap would then drop the page, and scrolling back over one that was pushed off
+        // screen is answered by those pixels. A page that was brought up to the file keeps that
+        // prepared view aside for exactly that reason, so it is left alone as well. Both are answered
+        // by [imageReleasableOnDetach], read here rather than from the fields above: those describe
+        // the moment the line was written, and the work above is what can change the answer.
+        val releasable = imageReleasableOnDetach()
+        metrics(
+            "detach",
+            page,
+            "view=$held loading=$loading releasable=$releasable src=$hadSource bg=$bg promo=$promo place=$place",
+        )
+        if (releasable) {
+            // Which says so itself, right after this line: a page whose image was let go has a line
+            recycle()
+        }
     }
 
     private fun initProgressIndicator() {
@@ -275,12 +318,18 @@ class PagerPageHolder(
         try {
             val config = imageConfig()
 
+            // Whether pages are prepared ahead of the turn at all. With the setting off, nothing below
+            // reads the cache and nothing is decoded here: every page hands its file to the view, which
+            // tiles it as it lays out. The gate is still asked about, so the wave's counts stay
+            // balanced, and with nothing asking it admits nothing.
+            val prepared = viewer.config.preloadPageBitmaps
+
             // Pixels for this page may already be decoded, by this holder or by an earlier one for a
             // page that was pushed off screen and is being looked at again. A half of a spread is
             // left out: it stands where the page it was made from stands, and shows the other half.
             val isSpreadHalf = page is InsertPage
             val cached =
-                if (isSpreadHalf) {
+                if (isSpreadHalf || !prepared) {
                     null
                 } else {
                     withContext(Dispatchers.Main) { viewer.bitmapCache.find(page) }
@@ -333,11 +382,21 @@ class PagerPageHolder(
             // own detail under zoom. A page that is only being given lead time has several turns
             // before it is asked for, and is shown as soon as it is — and when the reader does stop
             // on one, [promoteToFullDetail] hands the view the file instead, so this rule only ever
-            // holds for a page the reader jumped to without a holder ahead of the turn.
+            // holds for a page the reader jumped to without a holder ahead of the turn. The setting
+            // above is the last rule: with it off, no page takes this path.
             val isLeadPage = !viewer.isCurrent(page)
-            val decodedAt = metricsTime()
+            // The wait for a place at the gate and the work that runs once one is had are not the same
+            // thing one number can tell apart: a page that was queued behind the ones near the reading
+            // position pays whatever the pages ahead of it cost, and a page whose own decode is slow
+            // pays its own. A turn that lands on a black screen cannot say which of the two it is
+            // waiting for, and only the second is something the page itself can be made to cost less.
+            // `gate=` is the first and is left out for a page that asked for nothing; `decode=` below
+            // is the second, so the parts add up to what the page waited for its pixels rather than to
+            // what the page's own work cost.
+            var gateField = ""
+            var decodeMs = 0L
             val bitmap =
-                if (isAnimated || !isLeadPage) {
+                if (isAnimated || !isLeadPage || !prepared) {
                     // Nothing is decoded for this page, and the gate's wave counts it as having said so
                     viewer.decodeGate.withdraw()
                     null
@@ -358,21 +417,30 @@ class PagerPageHolder(
                     // is read again every time the gate decides, rather than fixed at the moment this
                     // page joined the queue — a page the reader jumped to is let through ahead of one
                     // they jumped past, even when the second asked first.
+                    val gateAt = metricsTime()
                     val slot = viewer.decodeGate.take({ viewer.decodePriority(page) }, big)
-                    try {
-                        withContext(Dispatchers.Default) {
-                            try {
-                                decodeToBitmap(source, viewer.screenWidth, viewer.screenHeight)
-                            } catch (e: Throwable) {
-                                logcat(LogPriority.ERROR, e)
-                                null
+                    // How long this page waited for a place, and which allowance it took. This is the
+                    // part of the turn that was not its own work: a page queued behind the ones near
+                    // the reading position pays whatever the pages ahead of it cost, and the gate's own
+                    // line for the same moment is what says who else was holding a place.
+                    gateField = " gate=${metricsSince(gateAt)} big=$big"
+                    val workAt = metricsTime()
+                    val decodedPixels =
+                        try {
+                            withContext(Dispatchers.Default) {
+                                try {
+                                    decodeToBitmap(source, viewer.screenWidth, viewer.screenHeight)
+                                } catch (e: Throwable) {
+                                    logcat(LogPriority.ERROR, e)
+                                    null
+                                }
                             }
+                        } finally {
+                            viewer.decodeGate.give(slot)
                         }
-                    } finally {
-                        viewer.decodeGate.give(slot)
-                    }
+                    decodeMs = metricsSince(workAt)
+                    decodedPixels
                 }
-            val decoded = metricsSince(decodedAt)
 
             var kept = false
             withContext(Dispatchers.Main) {
@@ -414,11 +482,18 @@ class PagerPageHolder(
                     " kept=$kept"
                 }
 
-            // Up to the page being accepted, not to every tile of it being drawn
+            // The parts of a turn, in the order they happen, so a slow page is read as which of them
+            // was slow rather than as a total: `read=` is the file, `process=` is splitting and
+            // rotating it, `gate=` is the wait for a place at the gate (`big=` says which allowance it
+            // took, and both are left out for a page that asked for nothing), and `decode=` is the
+            // pixels pass itself — which the `act=fit` line beside it splits further, into the decoder's
+            // own inflate and the walk over what is kept. `total=` is the whole of them and the hops
+            // between, so it is larger than the sum. Up to the page being accepted, not to every tile
+            // of it being drawn.
             metrics(
                 "page",
                 item,
-                "read=$read process=$processed decode=$decoded total=${metricsSince(started)} bytes=$bytes$pixels$keptField",
+                "read=$read process=$processed$gateField decode=$decodeMs total=${metricsSince(started)} bytes=$bytes$pixels$keptField",
             )
 
             // Only when the setting asks for it. A fixed theme colour is painted by the reader behind

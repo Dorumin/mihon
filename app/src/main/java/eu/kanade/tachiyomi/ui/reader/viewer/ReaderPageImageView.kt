@@ -63,6 +63,25 @@ open class ReaderPageImageView @JvmOverloads constructor(
     private var pageView: View? = null
 
     /**
+     * What the still view up here was given, named for the log: the pixels a page was prepared at and
+     * the file's own detail are not the same cost, and a holder that leaves the window with either of
+     * them up is one whose pixels nothing let go of. Set where the image is set, read only for the log.
+     */
+    private var imageFrom = "none"
+
+    /**
+     * When a load this view started, so the load's own cost can be said at whichever end answers it.
+     *
+     * The view's own decoding is the other way a page gets pixels — the file path, where the
+     * subsampling view reads and tiles the file as it lays out — and until now its cost was only
+     * inferable from the holder's `shown` line, which is why the two paths could not be compared
+     * against each other. Set only where a file is handed over: a page set from pixels that were made
+     * already has no load here to time, and says nothing rather than a zero that would read as a fast
+     * decode.
+     */
+    private var loadStartedAt = 0L
+
+    /**
      * A second still view, drawn over the first, that a page is brought up to the file's own detail
      * in.
      *
@@ -253,14 +272,30 @@ open class ReaderPageImageView @JvmOverloads constructor(
     }
 
     fun recycle() {
+        // What was let go here, read before anything is dropped. This is the only place that says a
+        // page's image was let go at all, and the holder's detach line is what says a page left the
+        // window; the two are read together to count how many images are alive at once. The webtoon
+        // adapter calls this for every holder it recycles; the pager path calls it only for a page
+        // whose image is over a file and is not being read any more, and leaves a prepared or
+        // promoted page alone because its pixels belong to the cache — see [imageReleasableOnDetach].
+        // A detached page with no line here is one whose pixels only the collector will free.
+        val held = heldImageView()
+        val detail = detailView != null
+        val preview = previewView != null
+        // A release that answers true here is a view let go while its image was still being read,
+        // which is the use-after-free case rather than a free
+        val loading = imageLoadRunning()
+        metrics("release", zoomPage, "view=$held loading=$loading detail=$detail preview=$preview")
         isImageShown = false
         stripRequest?.dispose()
         stripRequest = null
         // A promotion that was still loading is dropped, not left waiting for a page that is gone.
-        // Out of the tree only, and not recycled: `recycle()` closes the file, and a load that has
-        // started is still copying out of it. The task holds this view, so the file is let go when
-        // the task is done; closing it here is a free ahead of that work, which is what a page that
-        // was mid-load when the reader moved on crashes on.
+        // Out of the tree only, and not recycled: `recycle()` gives back the file and the pixels, and
+        // a load that has started is a native read out of the one and a native write into the other.
+        // Either half is what makes recycling mid-load a use-after-free rather than an error; the task
+        // holds the view, so both are given back when it is done, and closing the file here is only
+        // ever a free ahead of that work — which is what a page that was mid-load when the reader
+        // moved on crashes on.
         detailView?.let {
             removeView(it)
         }
@@ -279,6 +314,62 @@ open class ReaderPageImageView @JvmOverloads constructor(
             }
             it.isVisible = false
         }
+        imageFrom = "none"
+    }
+
+    /**
+     * What kind of image view is up here and what it was given, named for the holder's detach line:
+     * the holder is what knows the page, this is what knows what it holds. A holder that answers
+     * anything other than "none" as it leaves the window, and whose line says it could not be let go,
+     * is a page whose pixels only the collector will free.
+     */
+    fun heldImageView(): String = when (pageView) {
+        is SubsamplingScaleImageView -> imageFrom
+        is AppCompatImageView -> "anim"
+        is WebtoonStripImageView -> "strips"
+        null -> "none"
+        else -> "other"
+    }
+
+    /**
+     * Whether an image this view is drawing is still being read, which is what says whether the view
+     * can be let go at all. `recycle()` gives back the file and the pixels, and the read is a native
+     * write into those pixels: recycling a view whose load has started is a use-after-free rather than
+     * an error, which is why the places that drop a view mid-load take it out of the tree only.
+     *
+     * A page that failed to decode answers true as well — a view that never became ready has no load
+     * left in it, but nothing can tell the two apart from here.
+     */
+    fun imageLoadRunning(): Boolean {
+        // A second view that exists at all is one that was made to load a file beside the page
+        if (detailView != null) return true
+        val view = pageView ?: return false
+        return when (view) {
+            is SubsamplingScaleImageView -> !view.isReady()
+            else -> false
+        }
+    }
+
+    /**
+     * Whether the image this view is up is this view's alone to give back, which is what says whether
+     * a holder may call [recycle] as it leaves the window. Two answers, both about whose hands the
+     * pixels are in:
+     *
+     * - a view that is on screen from prepared pixels is drawing a bitmap the page cache holds, and
+     *   a page that was brought up to the file keeps that view aside in [previewView], whose bitmap
+     *   is the cache's too. Recycling either gives pixels back that are not this holder's to give,
+     *   and the cache's own check for a recycled bitmap then drops the page — which is what scrolling
+     *   back over a page that was pushed off screen depends on.
+     * - a view whose image is still being read cannot be touched at all, for the reason in
+     *   [imageLoadRunning].
+     *
+     * Asked where it is asked rather than carried from an earlier reading: what a holder stops as it
+     * detaches is what can change the answer.
+     */
+    fun imageReleasableOnDetach(): Boolean {
+        if (previewView != null) return false
+        if (imageFrom != "file") return false
+        return !imageLoadRunning()
     }
 
     /**
@@ -563,9 +654,20 @@ open class ReaderPageImageView @JvmOverloads constructor(
         config: Config,
     ) = (pageView as? SubsamplingScaleImageView)?.apply {
         applyImageConfig(config)
+        // Cleared here rather than left from the last file this view was given, so a view that is
+        // reused for a page set from pixels cannot answer with the earlier page's load
+        loadStartedAt = 0L
         setOnImageEventListener(
             object : SubsamplingScaleImageView.DefaultOnImageEventListener() {
                 override fun onReady() {
+                    // What the library's own reading and tiling cost, for a page that came from a file.
+                    // A page set from pixels that were made already has no load here to time, so it says
+                    // nothing rather than a zero that would read as a fast decode. This is the cost the
+                    // pixels path spends in its holder instead, and the two are what a reader who finds
+                    // one path slower than the other on small files asks against.
+                    if (loadStartedAt > 0L) {
+                        metrics("drawn", zoomPage, "view=$imageFrom load=${metricsSince(loadStartedAt)}")
+                    }
                     setupZoom(config)
                     if (isVisibleOnScreen()) landscapeZoom(true)
                     this@ReaderPageImageView.onImageLoaded()
@@ -580,14 +682,20 @@ open class ReaderPageImageView @JvmOverloads constructor(
         when (data) {
             is Bitmap -> {
                 setImage(ImageSource.bitmap(data))
+                imageFrom = "pixels"
                 isVisible = true
             }
             is BitmapDrawable -> {
                 setImage(ImageSource.bitmap(data.bitmap))
+                imageFrom = "pixels"
                 isVisible = true
             }
             is BufferedSource -> {
+                // The load is timed from here, because the library reads the file when the view is
+                // first drawn and this is as early as the file is in the view
+                loadStartedAt = metricsTime()
                 setImage(ImageSource.inputStream(data.inputStream()))
+                imageFrom = "file"
                 isVisible = true
             }
             else -> {
@@ -636,7 +744,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     // The swap happened: the file is on screen and what was is taken away in the same
                     // moment. The page id is the holder's, handed over for the zoom log, so a line that
                     // has none is one whose holder never set it — a view made outside a page holder.
-                    metrics("swap", zoomPage, "")
+                    // `load=` is what the reading of the file cost, which is the thing a reader pays
+                    // when they stop on a page that was prepared ahead: the turn that made this page the
+                    // one being read does not wait for it, so the load is what the stop waits for.
+                    metrics("swap", zoomPage, "load=${metricsSince(loadStartedAt)}")
                     // From here the gestures reach the file's own view, whose fit is the file's, not the
                     // viewport's, and whose ceiling was just written from that fit.
                     zoomSubject = "detail"
@@ -653,6 +764,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     previewView = preview
                     pageView = loaded
                     detailView = null
+                    imageFrom = "file"
                     this@ReaderPageImageView.onImageLoaded()
                 }
 
@@ -662,7 +774,14 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     // The file could not be read again. Without this line the promotion is silent: the
                     // preview stays up and nothing says a swap was tried and failed, which is how a page
                     // that never gets its detail looks the same as one that was never promoted.
-                    metrics("swapfail", null, "err=${e::class.simpleName} msg=${e.message}")
+                    // A failed promotion still paid its reading of the file, and `load=` is what says
+                    // so: a page that never gets its detail is only told apart from one that was never
+                    // promoted by a line like this beside the `promote` the holder wrote.
+                    metrics(
+                        "swapfail",
+                        null,
+                        "err=${e::class.simpleName} msg=${e.message} load=${metricsSince(loadStartedAt)}",
+                    )
                     // A page that cannot be read from the file again keeps what it was showing
                     detailView?.let {
                         removeView(it)
@@ -691,6 +810,9 @@ open class ReaderPageImageView @JvmOverloads constructor(
         // The source is read through `peek()`, which leaves the one the holder kept whole: a page that
         // is put back to its prepared pixels is promoted again the next time the reader stops on it,
         // and a source the first promotion consumed would answer the second with nothing at all.
+        // The load is timed from here rather than from where the place at the gate was asked for: the
+        // wait for one is the holder's `gate=`, and this is the part that was the library's own reading
+        loadStartedAt = metricsTime()
         detail.setImage(ImageSource.inputStream(source.peek().inputStream()))
         // A load was started, so whatever was held for it before this call is still held: the listeners
         // above are what let it go, at whichever of the two ends this load answers.
@@ -717,6 +839,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
         preview.isVisible = true
         pageView = preview
         previewView = null
+        imageFrom = "pixels"
         // The gestures reach the prepared pixels again, whose fit is the viewport's
         zoomSubject = "page"
         return true
@@ -742,8 +865,10 @@ open class ReaderPageImageView @JvmOverloads constructor(
     fun cancelPromotion(): Boolean {
         val detail = detailView ?: return false
         removeView(detail)
-        // Not recycled: the tile-init task this view started is still reading the file, and `recycle()`
-        // closes it mid-read. The task holds the view, so the file is given back when it finishes.
+        // Not recycled: the tile-init task this view started is still reading the file and writing its
+        // tiles into pixels, and `recycle()` gives back both — a native write into freed pixels is a
+        // use-after-free, not an error. The task holds the view, so the file and the tiles are given
+        // back when it finishes.
         detailView = null
         return true
     }

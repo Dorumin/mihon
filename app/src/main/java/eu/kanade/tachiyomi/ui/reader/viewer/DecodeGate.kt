@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.ui.reader.viewer
 
+import eu.kanade.tachiyomi.ui.reader.viewer.metrics
 import kotlinx.coroutines.CompletableDeferred
 
 /**
@@ -114,6 +115,19 @@ class DecodeGate(val smallCapacity: Int, val bigCapacity: Int) {
             }
             throw e
         }
+        // The moment this page is let through, and what the gate holds at that moment. How many decodes
+        // are alive at once is the thing a slow turn is read against, and it is only knowable here: a
+        // holder knows its own wait, never who else was holding a place. `small=` and `big=` are the two
+        // allowances as pages in use over their capacity, `waiting=` is pages still queued behind this
+        // one. A line that shows both allowances at their capacity is a page whose place was handed over
+        // by another that finished at the same moment, which is what a run of pages that each report a
+        // long `gate=` and a short `decode=` looks like. Read beside the holder's `gate=`, which is how
+        // long this page waited to be one of these.
+        metrics(
+            "gate",
+            null,
+            "small=$inUseSmall/$smallCapacity big=$inUseBig/$bigCapacity waiting=${waiting.size}",
+        )
         return slot
     }
 

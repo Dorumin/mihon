@@ -61,6 +61,9 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
      * Pixels for the pages around the one being read, kept here rather than in a page's holder so
      * that they survive a page being pushed off screen, which is what makes turning back cheap.
      * Touched from the UI thread only.
+     *
+     * Whether pages are prepared at all is the reader's own setting, read through [config]; with it
+     * off nothing is looked up and nothing is stored here, and every page takes the file path.
      */
     val bitmapCache = PageBitmapCache()
 
@@ -143,11 +146,19 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         pager.isVisible = false // Don't layout the pager yet
         pager.layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         pager.isFocusable = false
-        // Five pages of lead either way. A page that is only being prepared has several turns of
-        // lead before it is asked for, which is what lets a large image be decoded and scaled down
-        // ahead of the turn instead of during it. The pages held this many turns out are the same
-        // pages the pixel cache is sized for, so the window and that budget are one constraint.
-        pager.offscreenPageLimit = 5
+        // How many pages of lead the pager keeps either way. Five is what the prepared path wants: a
+        // page that is only being prepared has several turns of lead before it is asked for, which is
+        // what lets a large image be decoded and scaled down ahead of the turn instead of during it.
+        // The pages held this many turns out are the same pages the pixel cache is sized for, so the
+        // window and that budget are one constraint.
+        // The window belongs to that same switch, and is not a second one to set. With the setting
+        // off nothing is prepared, so there is no lead time to spend, and every page in reach holds
+        // its own tiles over the file at the file's own resolution instead — the page being read plus
+        // this many either way is eleven of those, which is what runs the app out of heap on a large
+        // page. Off, the window goes back to the one page of lead it had before, which is why the
+        // setting is read here rather than followed live: the window is only right when the viewer is
+        // built, so the setting is meant to be set before a chapter is opened.
+        pager.offscreenPageLimit = if (readerPreferences.preloadPageBitmaps.get()) 5 else 1
         pager.id = R.id.reader_pager
         pager.adapter = adapter
         pager.addOnPageChangeListener(pagerListener)
@@ -330,6 +341,12 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
         // Whether the user would have seen an empty page when this one became current. How long that
         // window lasts is read off the log's own timestamps, against the `act=shown` line the holder
         // writes when the pixels arrive.
+        // Whether pages are prepared ahead of the turn at all. With the setting off there is nothing
+        // prepared to promote and nothing cached to let go; the demotion below still runs, because what
+        // it does then is only let go of a position the reader left on a page, which is not about the
+        // cache.
+        val prepared = config.preloadPageBitmaps
+
         // The pages the reader left go back to what they were prepared at. The tiles over a page's
         // file are the expensive thing a holder keeps — for the measured page, a pyramid over a
         // 7000×5000 PNG, many times the prepared bitmap — and only the page the reader stopped on
@@ -347,12 +364,17 @@ abstract class PagerViewer(val activity: ReaderActivity) : Viewer {
             holder.onPageSelected(forward)
             // The page the reader stopped on is the one that can spend its lead time on detail
             // rather than on being ready, so a page that was prepared ahead is given the file it
-            // came from here. It is the holder that knows whether it was prepared at all.
-            holder.promoteToFullDetail()
+            // came from here. It is the holder that knows whether it was prepared at all, and with
+            // the setting off nothing was: the view already holds the file.
+            if (prepared) {
+                holder.promoteToFullDetail()
+            }
         }
 
         // The reader has moved, so pixels kept for pages far away can be let go
-        bitmapCache.trimTo(adapter.items.filterIsInstance(ReaderPage::class.java), page)
+        if (prepared) {
+            bitmapCache.trimTo(adapter.items.filterIsInstance(ReaderPage::class.java), page)
+        }
 
         // Skip preload on inserts it causes unwanted page jumping
         if (page is InsertPage) {

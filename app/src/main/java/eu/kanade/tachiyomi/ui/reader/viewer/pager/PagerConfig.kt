@@ -40,6 +40,20 @@ class PagerConfig(
     var imageCropBorders = false
         private set
 
+    /**
+     * Whether pages away from the one being read are decoded ahead of the turn and their pixels kept,
+     * which is what makes a turn land on a page that is already drawn. It is a memory switch: the
+     * pixels for the pages in reach are held, and the page the reader stops on is swapped over to the
+     * file's own detail. Off, every page hands its file to the view and the view tiles it as it lays
+     * out, which is the older path: nothing is kept, a turn waits for the decode, and the reader
+     * looks ahead less far. The window it looks ahead over is set from this same setting, in the
+     * viewer, because a wide window is what gives a page its lead time — with nothing prepared it
+     * means a page in reach for every page of lead, each holding its own tiles over the file, which
+     * is what runs the app out of heap. The flow itself is in the page holder and in PageBitmapCache.
+     */
+    var preloadPageBitmaps = false
+        private set
+
     var navigateToPan = false
         private set
 
@@ -67,6 +81,9 @@ class PagerConfig(
 
         readerPreferences.navigateToPan
             .register({ navigateToPan = it })
+
+        readerPreferences.preloadPageBitmaps
+            .register({ preloadPageBitmaps = it })
 
         readerPreferences.landscapeZoom
             .register({ landscapeZoom = it }, { imagePropertyChangedListener?.invoke() })

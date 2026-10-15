@@ -2,7 +2,9 @@ package eu.kanade.tachiyomi.ui.reader.viewer
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import androidx.annotation.ColorInt
+import androidx.core.graphics.applyCanvas
 import androidx.core.graphics.blue
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.get
@@ -12,6 +14,8 @@ import androidx.core.graphics.set
 import ca.mpreg.imagedecoder.ImageDecoder
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import eu.kanade.tachiyomi.ui.reader.viewer.metrics
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsSince
+import eu.kanade.tachiyomi.ui.reader.viewer.metricsTime
 import okio.BufferedSource
 import kotlin.math.abs
 import kotlin.math.min
@@ -29,6 +33,10 @@ import kotlin.math.sqrt
  * Everything here is counted in decoded pixels rather than in bytes on disk, because what is being
  * bounded is memory held. A page that is tightly compressed can be very large once decoded, and
  * sizing the cache by the file would let one such page decide the whole budget.
+ *
+ * Whether any page is prepared at all is a reader setting, read in PagerConfig and asked about by the
+ * page holder; with it off nothing is looked up and nothing is stored here, and every page hands its
+ * file to its view instead.
  */
 /**
  * What a page's pixels are sized to, rather than a size they are refused at. A page is decoded at
@@ -136,9 +144,18 @@ private const val GRAYSCALE_SIZE = 0.25
  * way; the caller then hands the file to the view instead, which is the older path.
  */
 fun decodeToBitmap(source: BufferedSource, viewWidth: Int, viewHeight: Int): Bitmap {
+    // The two things this pass costs, told apart because they are asked about differently. The inflate
+    // is the decoder's own work over the file's pixels, so it is the part a page's resolution decides.
+    // The sizing below is over the pixels the page is *kept* at, which is about the same count for every
+    // page on one screen whatever the file was — a page is sized to the screen it is on, and the screen
+    // does not change with the file. So a single total cannot tell a page that was slow because its
+    // file was big from one that was slow because the sizing was, and the two are worth different
+    // things: the inflate is already native, and the sizing is what a change here can still act on.
+    val inflatedAt = metricsTime()
     val (frame, isHdr) = source.peek().inputStream().let { input ->
         ImageDecoder.open(input).use { it.decodeNext() to it.isHdr }
     }
+    val inflated = metricsSince(inflatedAt)
     return frame.use {
         val config = if (isHdr) Bitmap.Config.RGBA_F16 else Bitmap.Config.ARGB_8888
         val bytesPerPixel = if (isHdr) 8 else 4
@@ -159,6 +176,7 @@ fun decodeToBitmap(source: BufferedSource, viewWidth: Int, viewHeight: Int): Bit
         // and everything below — and the line that reports it — is about the page that is shown.
         val shownAt = if (CACHE_GRAYSCALE) fitScale * GRAYSCALE_SIZE else fitScale
 
+        val sizingAt = metricsTime()
         val sized = if (shownAt >= 1.0) {
             // Nothing to leave out: the page is kept at the size it came out at, so the frame's
             // pixels are copied into it once
@@ -179,9 +197,15 @@ fun decodeToBitmap(source: BufferedSource, viewWidth: Int, viewHeight: Int): Bit
             val rowBytes = srcWidth * bytesPerPixel
             val bandRows = (BAND_BYTES / rowBytes).toInt().coerceAtLeast(1).coerceAtMost(srcHeight)
             val band = createBitmap(srcWidth, bandRows, config)
+            // The band is scaled by Skia rather than walked here, which is the call the coil decoder's
+            // `decodeStrips` makes. Only the band is ever handed to it, so the scale stays inside the
+            // memory bound above: what is held at the peak is still the frame, one band, and the sized
+            // page. Filtering is a change of its own beside the speed: the walk this replaces took one
+            // pixel per output pixel, so a downscale threw whole rows and columns of the page away, which
+            // what makes thin lines on a page break or vanish at the reading zoom.
+            val across = scaledWidth.toFloat() / srcWidth
             frame.image.rewind()
             var srcTop = 0
-            var outTop = 0
             while (srcTop < srcHeight) {
                 val rows = min(bandRows, srcHeight - srcTop)
                 if (rows != band.height) {
@@ -193,30 +217,42 @@ fun decodeToBitmap(source: BufferedSource, viewWidth: Int, viewHeight: Int): Bit
                         limit((srcTop + rows) * rowBytes)
                     },
                 )
-                // An output row takes its source row in reading order, so walking the frame once in
-                // order answers every output row and keeps no row for later. The columns are sampled
-                // the same way, nearest first.
-                while (outTop < scaledHeight) {
-                    val srcY = outTop * srcHeight / scaledHeight
-                    if (srcY >= srcTop + rows) {
-                        break
-                    }
-                    val bandY = srcY - srcTop
-                    var outX = 0
-                    while (outX < scaledWidth) {
-                        sizedBitmap.set(outX, outTop, band.get(outX * srcWidth / scaledWidth, bandY))
-                        outX += 1
-                    }
-                    outTop += 1
+                // The output rows this band answers, which is the mapping the walk used read from the
+                // other side: an output row takes its source row in reading order, so a band of source
+                // rows answers exactly the output rows between those two bounds. Each band is scaled to
+                // its own share rather than to the page's scale, which is what makes the shares add up
+                // to `scaledHeight` exactly — one scale for the whole page rounded per band, and a page
+                // of many bands would then leave a row unfilled or draw one twice.
+                val outTop = srcTop * scaledHeight / srcHeight
+                val outRows = ((srcTop + rows) * scaledHeight / srcHeight) - outTop
+                val matrix = Matrix().apply { setScale(across, outRows.toFloat() / rows) }
+                val scaledBand = Bitmap.createBitmap(band, 0, 0, srcWidth, rows, matrix, true)
+                sizedBitmap.applyCanvas {
+                    drawBitmap(scaledBand, 0F, outTop.toFloat(), null)
                 }
+                scaledBand.recycle()
                 srcTop += rows
             }
             band.recycle()
-            // No page id here: this is the one place that knows the file's dimensions, and the line
-            // is read against the holder's for the same page by what surrounds it
-            metrics("fit", null, "src=${srcWidth}x${srcHeight} dim=${scaledWidth}x${scaledHeight} scale=${shownAt}")
             sizedBitmap
         }
+        val sizedMs = metricsSince(sizingAt)
+        // What this pass cost and what it was asked for. `src=` is the frame the decoder inflated,
+        // `dim=` is what is kept, and the two timings are the halves above: `inflate=` is the
+        // decoder's work over the file, `size=` is the sizing over what is kept — a copy for a page that
+        // was kept as it came out, the band loop and the native scale for one that was not. The two are
+        // read against `dim=` rather than against `src=`: the sizing is over the pixels that are kept, so
+        // its cost is what `dim=` counts, and a page whose `size=` is large at a small `dim=` is a
+        // page the sizing is being asked to do more of than it needs. A page that was kept at its own
+        // size says so with `scale=1` rather than by leaving the line out, which is what makes the
+        // absence of a line mean only "this page did not take the pixels path". No page id here: this
+        // is the one place that knows the file's dimensions, and the line is read against the holder's
+        // for the same page by what surrounds it.
+        metrics(
+            "fit",
+            null,
+            "src=${srcWidth}x${srcHeight} dim=${sized.width}x${sized.height} scale=${shownAt} inflate=$inflated size=$sizedMs",
+        )
         // The debug flag asks for grey, written into the pixels this pass just made
         if (CACHE_GRAYSCALE) toGrayscale(sized) else sized
     }

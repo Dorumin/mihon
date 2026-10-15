@@ -27,6 +27,11 @@ class ReaderPreferences(
         true,
     )
 
+    val preloadPageBitmaps: Preference<Boolean> = preferenceStore.getBoolean(
+        "pref_reader_preload_page_bitmaps",
+        true,
+    )
+
     val flashOnPageChange: Preference<Boolean> = preferenceStore.getBoolean("pref_reader_flash", false)
 
     val flashDurationMillis: Preference<Int> = preferenceStore.getInt("pref_reader_flash_duration", MILLI_CONVERSION)

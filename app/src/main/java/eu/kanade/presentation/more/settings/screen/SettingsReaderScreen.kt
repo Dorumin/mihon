@@ -248,6 +248,11 @@ object SettingsReaderScreen : SearchableSettings {
                     visible = navMode != 5,
                 ),
                 Preference.PreferenceItem.SwitchPreference(
+                    preference = readerPreferences.preloadPageBitmaps,
+                    title = stringResource(MR.strings.pref_preload_page_bitmaps),
+                    subtitle = stringResource(MR.strings.pref_preload_page_bitmaps_summary),
+                ),
+                Preference.PreferenceItem.SwitchPreference(
                     preference = dualPageSplitPref,
                     title = stringResource(MR.strings.pref_dual_page_split),
                     onValueChanged = {
